@@ -858,13 +858,14 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
     }
   }
   // Toon lighting: each light's contribution (attenuation times diffuse) falls into
-  // three bands, and a specular channel's highlight gets a hard edge.
+  // three bands, and a specular channel's highlight (GX_AF_SPEC) gets a hard edge,
+  // where the diffuse term only says whether the light faces the surface.
   std::string_view lightTerm = "attn * diff"sv;
   if (config.toonLighting) {
-    if (diffFn == GX_DF_CLAMP) {
+    if (cc.attnFn == GX_AF_SPEC) {
+      lightTerm = diffFn == GX_DF_NONE ? "toon_spec(attn)"sv : "toon_spec(attn) * step(1e-4, diff)"sv;
+    } else if (diffFn == GX_DF_CLAMP) {
       lightTerm = "toon_band(attn * diff)"sv;
-    } else if (diffFn == GX_DF_NONE && cc.attnFn == GX_AF_SPEC) {
-      lightTerm = "toon_spec(attn)"sv;
     }
   }
   return fmt::format(R"""(
