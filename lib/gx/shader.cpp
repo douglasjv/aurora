@@ -858,7 +858,7 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
     }
   }
   // Toon lighting: each light's contribution (attenuation times diffuse) falls into
-  // three bands, and a specular channel's highlight (GX_AF_SPEC) gets a hard edge,
+  // three bands (0, 0.5, 0.8), and a specular channel's highlight (GX_AF_SPEC) gets a hard edge,
   // where the diffuse term only says whether the light faces the surface.
   std::string_view lightTerm = "attn * diff"sv;
   if (config.toonLighting) {
@@ -1184,7 +1184,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           "    return select(vec3f(0.0), normalize(n), dot(n, n) > 1e-10);\n"
           "}\n"
           "fn toon_band(x: f32) -> f32 {\n"
-          "    return 0.5 * smoothstep(0.10, 0.16, x) + 0.5 * smoothstep(0.50, 0.56, x);\n"
+          "    return 0.5 * smoothstep(0.10, 0.16, x) + 0.3 * smoothstep(0.50, 0.56, x);\n"
           "}\n"
           "fn toon_spec(x: f32) -> f32 {\n"
           "    return smoothstep(0.42, 0.50, x);\n"
@@ -1692,6 +1692,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));";
     } else {
       fragmentReturn += "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);";
+    }
+    if (config.cutoutHint) {
+      fragmentReturn += "\n    out.normal.w = 1.0 / 3.0;";
     }
     fragmentReturn += "\n    return out;";
   }

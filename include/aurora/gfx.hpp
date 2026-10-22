@@ -193,6 +193,11 @@ bool is_offscreen() noexcept;
 /// lights per vertex). Takes effect for draws recorded after the call; pipelines key on it.
 void set_toon_lighting(bool enabled) noexcept;
 
+/// Cutout hints: draws with an alpha test (leaf cards, grass, fences) write alpha 1/3 to
+/// the normal target instead of 1 (with a normal) or 0 (without), so a post pass reading
+/// resolved normals can tell cut-out texture edges from geometry edges. Off by default.
+void set_cutout_hints(bool enabled) noexcept;
+
 /// Increments on aurora_end_frame.
 uint32_t current_frame() noexcept;
 

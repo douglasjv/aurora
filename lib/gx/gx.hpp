@@ -50,6 +50,8 @@ constexpr bool EnableDebugPrints = false;
 constexpr bool UsePerPixelLighting = false;
 // Toon lighting (aurora::gfx::set_toon_lighting) lights per pixel whatever UsePerPixelLighting says.
 extern bool g_toonLighting;
+// aurora::gfx::set_cutout_hints: alpha-tested draws mark the normal target (alpha 1/3).
+extern bool g_cutoutHints;
 constexpr bool UseReversedZ = true;
 
 constexpr u32 MaxTextures = GX_MAX_TEXMAP;
@@ -497,7 +499,8 @@ struct ShaderConfig {
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
   u8 fogRangeEnabled : 1 = false;
   u8 toonLighting : 1 = false; // aurora::gfx::set_toon_lighting: per-pixel lighting in bands
-  u8 pad1 : 4 = 0;
+  u8 cutoutHint : 1 = false;   // aurora::gfx::set_cutout_hints and an alpha test: normal alpha 1/3
+  u8 pad1 : 3 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;

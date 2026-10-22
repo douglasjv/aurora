@@ -463,6 +463,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   }
   if (g_gxState.alphaCompare) {
     config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
+    config.shaderConfig.cutoutHint = g_cutoutHints;
   }
   const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
   const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);
@@ -627,8 +628,10 @@ void shutdown() noexcept {
   texture::shutdown();
 }
 bool g_toonLighting = false;
+bool g_cutoutHints = false;
 } // namespace aurora::gx
 
 namespace aurora::gfx {
 void set_toon_lighting(bool enabled) noexcept { gx::g_toonLighting = enabled; }
+void set_cutout_hints(bool enabled) noexcept { gx::g_cutoutHints = enabled; }
 } // namespace aurora::gfx
