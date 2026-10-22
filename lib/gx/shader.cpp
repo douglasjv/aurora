@@ -776,11 +776,15 @@ constexpr std::string_view nbt_slice_local(NbtSlice slice) noexcept {
 
 constexpr bool is_emboss_texgen(GXTexGenType type) noexcept { return type >= GX_TG_BUMP0 && type <= GX_TG_BUMP7; }
 
+constexpr bool per_pixel_lighting(const ShaderConfig& config) noexcept {
+  return UsePerPixelLighting || config.toonLighting;
+}
+
 auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 i, bool alpha) -> std::string {
   std::string_view swizzle = alpha ? ".a"sv : ""sv;
   std::string outVar;
   std::string_view posVar;
-  if (UsePerPixelLighting) {
+  if (per_pixel_lighting(config)) {
     outVar = fmt::format("rast{}", i);
     posVar = "in.mv_pos"sv;
   } else {
@@ -789,7 +793,7 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   }
   std::string ambSrc, matSrc;
   if (cc.ambSrc == GX_SRC_VTX) {
-    if (UsePerPixelLighting) {
+    if (per_pixel_lighting(config)) {
       ambSrc = fmt::format("in.clr{}", i);
     } else {
       ambSrc = vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i));
@@ -798,7 +802,7 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
     ambSrc = fmt::format("ubuf.cc{0}{1}_amb", i, alpha ? "a"sv : ""sv);
   }
   if (cc.matSrc == GX_SRC_VTX) {
-    if (UsePerPixelLighting) {
+    if (per_pixel_lighting(config)) {
       matSrc = fmt::format("in.clr{}", i);
     } else {
       matSrc = vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i));
@@ -820,7 +824,9 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
           var dist_attn = dot(light.dist_att, vec3f(1.0, dist, dist2));
           attn = max(0.0, cos_attn / dist_attn);)""");
   } else if (cc.attnFn == GX_AF_SPEC) {
-    std::string_view normal = UsePerPixelLighting ? "in.mv_nrm"sv : "mv_nrm"sv;
+    std::string_view normal = config.toonLighting      ? "toon_nrm(in.mv_nrm)"sv
+                              : per_pixel_lighting(config) ? "in.mv_nrm"sv
+                                                           : "mv_nrm"sv;
     std::string dist_attn = diffFn != GX_DF_NONE
                                 ? "max(0.0, dot(normalize(light.dist_att), vec3f(1.0, attn, attn * attn)));"
                                 : "max(0.0, dot(light.dist_att, vec3f(1.0, attn, attn * attn)));";
@@ -835,16 +841,30 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   if (diffFn == GX_DF_NONE) {
     lightDiffFn = "1.0"sv;
   } else if (diffFn == GX_DF_SIGN) {
-    if (UsePerPixelLighting) {
+    if (config.toonLighting) {
+      lightDiffFn = "dot(ldir, toon_nrm(in.mv_nrm))"sv;
+    } else if (per_pixel_lighting(config)) {
       lightDiffFn = "dot(ldir, in.mv_nrm)"sv;
     } else {
       lightDiffFn = "dot(ldir, mv_nrm)"sv;
     }
   } else if (diffFn == GX_DF_CLAMP) {
-    if (UsePerPixelLighting) {
+    if (config.toonLighting) {
+      lightDiffFn = "max(0.0, dot(ldir, toon_nrm(in.mv_nrm)))"sv;
+    } else if (per_pixel_lighting(config)) {
       lightDiffFn = "max(0.0, dot(ldir, in.mv_nrm))"sv;
     } else {
       lightDiffFn = "max(0.0, dot(ldir, mv_nrm))"sv;
+    }
+  }
+  // Toon lighting: each light's contribution (attenuation times diffuse) falls into
+  // three bands, and a specular channel's highlight gets a hard edge.
+  std::string_view lightTerm = "attn * diff"sv;
+  if (config.toonLighting) {
+    if (diffFn == GX_DF_CLAMP) {
+      lightTerm = "toon_band(attn * diff)"sv;
+    } else if (diffFn == GX_DF_NONE && cc.attnFn == GX_AF_SPEC) {
+      lightTerm = "toon_spec(attn)"sv;
     }
   }
   return fmt::format(R"""(
@@ -859,12 +879,12 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
           ldir = ldir / dist;
           var attn: f32;{2}
           var diff = {3};
-          lighting = lighting + (attn * diff * light.color);
+          lighting = lighting + ({10} * light.color);
       }}
       {7}{8} = ({4} * clamp(lighting, vec4f(0.0), vec4f(1.0))){8};
     }})""",
                      i, GX::MaxLights, lightAttnFn, lightDiffFn, matSrc, ambSrc, posVar, outVar, swizzle,
-                     alpha ? "a"sv : ""sv);
+                     alpha ? "a"sv : ""sv, lightTerm);
 }
 
 absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
@@ -1066,7 +1086,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     vtxXfrAttrsPre += "\n    out.nrm = mv_nrm;";
   }
   const bool useNormalTarget = normalAttachment != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE;
-  if (useNormalTarget && !(UsePerPixelLighting && info.lightingEnabled)) {
+  if (useNormalTarget && !(per_pixel_lighting(config) && info.lightingEnabled)) {
     vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.mv_nrm = mv_nrm;";
   }
@@ -1156,7 +1176,20 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         "    cos_att: vec3f,\n"
         "    dist_att: vec3f,\n"
         "};";
-    if (UsePerPixelLighting) {
+    if (config.toonLighting) {
+      uniformPre +=
+          "\n"
+          "fn toon_nrm(n: vec3f) -> vec3f {\n"
+          "    return select(vec3f(0.0), normalize(n), dot(n, n) > 1e-10);\n"
+          "}\n"
+          "fn toon_band(x: f32) -> f32 {\n"
+          "    return 0.5 * smoothstep(0.10, 0.16, x) + 0.5 * smoothstep(0.50, 0.56, x);\n"
+          "}\n"
+          "fn toon_spec(x: f32) -> f32 {\n"
+          "    return smoothstep(0.42, 0.50, x);\n"
+          "}";
+    }
+    if (per_pixel_lighting(config)) {
       vtxOutAttrs += fmt::format("\n    @location({}) mv_pos: vec3f,", vtxOutIdx++);
       vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
       vtxXfrAttrs += fmt::format(FMT_STRING(R"""(
@@ -1186,7 +1219,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     }
 
     // Output vertex color if necessary
-    if (UsePerPixelLighting) {
+    if (per_pixel_lighting(config)) {
       if ((cc.lightingEnabled && cc.ambSrc == GX_SRC_VTX) || cc.matSrc == GX_SRC_VTX ||
           (cca.lightingEnabled && cca.ambSrc == GX_SRC_VTX) || cca.matSrc == GX_SRC_VTX) {
         vtxOutAttrs += fmt::format("\n    @location({}) clr{}: vec4f,", vtxOutIdx++, i);
@@ -1194,7 +1227,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       }
     }
 
-    if (UsePerPixelLighting) {
+    if (per_pixel_lighting(config)) {
       fragmentFnPre += fmt::format("\n    var rast{}: vec4f;", i);
       fragmentFnPre += lighting_func(config, cc, i, false);
       fragmentFnPre += lighting_func(config, cca, i, true);

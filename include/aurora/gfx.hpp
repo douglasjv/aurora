@@ -188,6 +188,11 @@ bool create_pass(uint32_t width, uint32_t height);
 /// True while an offscreen pass (create_pass or GXCreateFrameBuffer) is open.
 bool is_offscreen() noexcept;
 
+/// Toon lighting: lit color channels are lit per pixel, each light's diffuse term falls
+/// into three bands and specular highlights get hard edges. Off by default (the console
+/// lights per vertex). Takes effect for draws recorded after the call; pipelines key on it.
+void set_toon_lighting(bool enabled) noexcept;
+
 /// Increments on aurora_end_frame.
 uint32_t current_frame() noexcept;
 
