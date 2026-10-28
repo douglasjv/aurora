@@ -26,6 +26,11 @@ const TextureStats& texture_stats() noexcept;
 namespace texture {
 constexpr uint64_t ContentCacheBudgetBytes = 128ull * 1024ull * 1024ull;
 constexpr uint64_t ObjectCacheIdleFrames = 600;
+// How often (in frames) the object caches are swept for idle entries. A sweep walks
+// every slot of the maps, so sweeping each frame costs time in proportion to their
+// capacity even when nothing has expired; an entry outlives its idle limit by at most
+// this many frames.
+constexpr uint64_t ObjectCacheSweepInterval = 64;
 constexpr bool AsyncTextureReplacements = true;
 constexpr uint32_t ReplacementThumbnailDim = 64;
 constexpr uint64_t ReplacementPublishBudgetBytes = 12ull * 1024ull * 1024ull;
