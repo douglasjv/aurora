@@ -465,7 +465,20 @@ void touch_bound_texture(const GXTexObj_& obj) {
   }
 }
 
+// Releases the slots of a map left mostly empty, since erasing never shrinks one and
+// iteration costs time per slot.
+template <typename Map>
+void shrink_if_sparse(Map& map) {
+  constexpr size_t MinCapacity = 1024;
+  if (map.capacity() > MinCapacity && map.size() * 4 < map.capacity()) {
+    map.rehash(0);
+  }
+}
+
 void sweep_object_caches() {
+  if (s_frameCount % texture::ObjectCacheSweepInterval != 0) {
+    return;
+  }
   const auto expired = [](uint64_t lastUsedFrame) {
     return s_frameCount > lastUsedFrame && s_frameCount - lastUsedFrame > texture::ObjectCacheIdleFrames;
   };
@@ -490,12 +503,15 @@ void sweep_object_caches() {
         ++it;
       }
     }
+    shrink_if_sparse(cache.dynamicPaletteTextures);
     if (expired(cache.lastUsedFrame) && cache.staticTextureUsers.empty() && cache.dynamicPaletteTextures.empty()) {
       s_tlutObjectCaches.erase(cacheIt++);
     } else {
       ++cacheIt;
     }
   }
+  shrink_if_sparse(s_textureObjectCaches);
+  shrink_if_sparse(s_tlutObjectCaches);
 }
 
 bool use_replacement(std::optional<gfx::texture_replacement::ReplacementResult> replacement, gfx::TextureHandle& handle,
