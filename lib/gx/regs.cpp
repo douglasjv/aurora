@@ -908,6 +908,10 @@ void xf_load_projection(const u8* data) noexcept {
   f32 p4 = read_bits<f32>(data + 16);
   f32 p5 = read_bits<f32>(data + 20);
   u32 projType = read_bits<u32>(data + 24);
+  if (g_bumpMapping.enabled && g_gxState.projType != static_cast<GXProjectionType>(projType)) {
+    // Bump mapping applies to perspective draws only, so the projection type is pipeline state.
+    g_gxState.dirty |= DirtyPipeline;
+  }
   g_gxState.projType = static_cast<GXProjectionType>(projType);
   auto& proj = g_gxState.proj;
   proj = {};

@@ -198,6 +198,26 @@ void set_toon_lighting(bool enabled) noexcept;
 /// resolved normals can tell cut-out texture edges from geometry edges. Off by default.
 void set_cutout_hints(bool enabled) noexcept;
 
+/// Bump mapping from texture detail: opaque, depth-writing perspective draws take a height
+/// from their base texture's luminance (bright is raised), perturb the surface normal
+/// with its slope, and shade the TEV result by how the bumped normal faces a fixed
+/// view-space light (upper left, in front) compared with the flat one. The console never
+/// had it. Off by default; with it off the generated shaders are unchanged.
+struct BumpMapping {
+  bool enabled = false;
+  /// Slope per texel for a full black-to-white step (how deep the relief reads).
+  float depth = 2.0f;
+  /// How much the shading moves the colour: colour x (1 + shade x (N_bump.L - N.L)).
+  float shade = 0.9f;
+  /// Strength of a white highlight where the bumped normal mirrors the light at the eye.
+  float shine = 0.0f;
+  /// Leave out draws whose vertices carry normals (the game's lit models: characters,
+  /// props), so only pre-lit scenery gets relief.
+  bool sceneryOnly = false;
+};
+/// Takes effect for draws recorded after the call; pipelines key on whether a draw is bumped.
+void set_bump_mapping(const BumpMapping& settings) noexcept;
+
 /// Increments on aurora_end_frame.
 uint32_t current_frame() noexcept;
 

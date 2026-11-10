@@ -1,5 +1,6 @@
 #pragma once
 #include <dolphin/gx.h>
+#include <aurora/gfx.hpp>
 #include <aurora/math.hpp>
 
 #include "../internal.hpp"
@@ -52,6 +53,8 @@ constexpr bool UsePerPixelLighting = false;
 extern bool g_toonLighting;
 // aurora::gfx::set_cutout_hints: alpha-tested draws mark the normal target (alpha 1/3).
 extern bool g_cutoutHints;
+// aurora::gfx::set_bump_mapping: texture-derived relief on opaque perspective draws.
+extern gfx::BumpMapping g_bumpMapping;
 constexpr bool UseReversedZ = true;
 
 constexpr u32 MaxTextures = GX_MAX_TEXMAP;
@@ -500,7 +503,8 @@ struct ShaderConfig {
   u8 fogRangeEnabled : 1 = false;
   u8 toonLighting : 1 = false; // aurora::gfx::set_toon_lighting: per-pixel lighting in bands
   u8 cutoutHint : 1 = false;   // aurora::gfx::set_cutout_hints and an alpha test: normal alpha 1/3
-  u8 pad1 : 3 = 0;
+  u8 bumpMap : 1 = false;      // aurora::gfx::set_bump_mapping and a bump source (bump_source_stage)
+  u8 pad1 : 2 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
@@ -552,6 +556,10 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                                 DstAlphaMode dstAlphaMode) noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
+// The TEV stage whose texture is the bump height source: the first stage that samples a
+// texture through a plain 2x4 matrix texgen from a TEX attribute, with no indirect lookup.
+// -1 when there is none.
+int bump_source_stage(const ShaderConfig& config) noexcept;
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
 u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept;

@@ -465,6 +465,14 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
     config.shaderConfig.cutoutHint = g_cutoutHints;
   }
+  if (g_bumpMapping.enabled && g_gxState.projType == GX_PERSPECTIVE && config.shaderConfig.lineMode == 0 &&
+      g_gxState.depthUpdate && g_gxState.colorUpdate && g_gxState.blendMode != GX_BM_SUBTRACT &&
+      g_gxState.blendMode != GX_BM_LOGIC &&
+      !(g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacDst == GX_BL_ONE) &&
+      !(g_bumpMapping.sceneryOnly && config.shaderConfig.attrs[GX_VA_NRM].attrType != GX_NONE) &&
+      bump_source_stage(config.shaderConfig) >= 0) {
+    config.shaderConfig.bumpMap = true;
+  }
   const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
   const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);
   const bool hasAlpha = efb_has_alpha(g_gxState.pixelFmt);
@@ -629,9 +637,11 @@ void shutdown() noexcept {
 }
 bool g_toonLighting = false;
 bool g_cutoutHints = false;
+gfx::BumpMapping g_bumpMapping;
 } // namespace aurora::gx
 
 namespace aurora::gfx {
 void set_toon_lighting(bool enabled) noexcept { gx::g_toonLighting = enabled; }
 void set_cutout_hints(bool enabled) noexcept { gx::g_cutoutHints = enabled; }
+void set_bump_mapping(const BumpMapping& settings) noexcept { gx::g_bumpMapping = settings; }
 } // namespace aurora::gfx

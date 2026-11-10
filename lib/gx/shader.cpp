@@ -891,6 +891,25 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
 absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
 } // namespace
 
+int bump_source_stage(const ShaderConfig& config) noexcept {
+  for (u32 i = 0; i < config.tevStageCount; ++i) {
+    const auto& stage = config.tevStages[i];
+    if (!uses_texture_sample(stage) || stage.texCoordId == GX_TEXCOORD_NULL || stage.texCoordId >= MaxTexCoord) {
+      continue;
+    }
+    if (stage.indTexMtxId != GX_ITM_OFF || stage.indTexWrapS != GX_ITW_OFF || stage.indTexWrapT != GX_ITW_OFF ||
+        stage.indTexAddPrev) {
+      continue;
+    }
+    const auto& tcg = config.tcgs[stage.texCoordId];
+    if (tcg.type != GX_TG_MTX2x4 || tcg.src < GX_TG_TEX0 || tcg.src > GX_TG_TEX7) {
+      continue;
+    }
+    return static_cast<int>(i);
+  }
+  return -1;
+}
+
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
                                 uint32_t normalAttachment) noexcept {
   ZoneScoped;
@@ -1090,6 +1109,12 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   if (useNormalTarget && !(per_pixel_lighting(config) && info.lightingEnabled)) {
     vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.mv_nrm = mv_nrm;";
+  }
+  // Bump mapping (aurora::gfx::set_bump_mapping) needs the view-space position per pixel.
+  const int bumpStage = config.bumpMap && config.lineMode == 0 ? bump_source_stage(config) : -1;
+  if (bumpStage >= 0) {
+    vtxOutAttrs += fmt::format("\n    @location({}) bump_pos: vec3f,", vtxOutIdx++);
+    vtxXfrAttrsPre += "\n    out.bump_pos = mv_pos;";
   }
 
   uniBufAttrs += "\n    proj: mat4x4f,";
@@ -1557,6 +1582,69 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFnPre +=
         fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
                     underlying(stage.texMapId), uvIn);
+  }
+  if (bumpStage >= 0) {
+    // Height is the base texture's luminance (bright is raised), its slope taken by central
+    // differences one texel apart (or one pixel's footprint, whichever is wider, so distant
+    // and minified surfaces stay calm). The surface frame comes from screen-space
+    // derivatives: the face normal from the position's, and the directions in which u and v
+    // grow from the position's and the texcoord's (the cotangent frame), so no vertex
+    // tangents or normals are needed. The colour is shaded by how much more or less the
+    // bumped normal faces a fixed view-space light than the flat one, so the game's own
+    // lighting of the surface is kept and only the relief is added.
+    const auto& stage = config.tevStages[bumpStage];
+    const u32 m = underlying(stage.texMapId);
+    const u32 c = underlying(stage.texCoordId);
+    const auto& bump = g_bumpMapping;
+    uniformPre +=
+        "\n"
+        "fn bump_height(c: vec4f) -> f32 {\n"
+        "    return dot(c.rgb, vec3f(0.299, 0.587, 0.114));\n"
+        "}";
+    fragmentFnPre += fmt::format(
+        "\n    // Bump mapping from TEV stage {stage}'s texture"
+        "\n    let bump_uv = tex{c}_uv;"
+        "\n    let bump_texel = 1.0 / max(ubuf.tex{m}_size_bias.xy, vec2f(1.0));"
+        "\n    let bump_duvdx = dpdx(bump_uv);"
+        "\n    let bump_duvdy = dpdy(bump_uv);"
+        "\n    let bump_step = max(bump_texel, max(abs(bump_duvdx), abs(bump_duvdy)));"
+        "\n    let bump_su = vec2f(bump_step.x, 0.0);"
+        "\n    let bump_sv = vec2f(0.0, bump_step.y);"
+        "\n    let bump_hu = bump_height(textureSampleBias(tex{m}, tex{m}_samp, bump_uv + bump_su, ubuf.tex{m}_size_bias.z))"
+        "\n        - bump_height(textureSampleBias(tex{m}, tex{m}_samp, bump_uv - bump_su, ubuf.tex{m}_size_bias.z));"
+        "\n    let bump_hv = bump_height(textureSampleBias(tex{m}, tex{m}_samp, bump_uv + bump_sv, ubuf.tex{m}_size_bias.z))"
+        "\n        - bump_height(textureSampleBias(tex{m}, tex{m}_samp, bump_uv - bump_sv, ubuf.tex{m}_size_bias.z));"
+        "\n    let bump_slope = vec2f(bump_hu, bump_hv) * ({depth:.6f} * 0.5) * bump_texel / bump_step;"
+        "\n    let bump_dp1 = dpdx(in.bump_pos);"
+        "\n    let bump_dp2 = dpdy(in.bump_pos);"
+        "\n    let bump_cross = cross(bump_dp1, bump_dp2);"
+        "\n    let bump_area = dot(bump_cross, bump_cross);"
+        "\n    var bump_shade = 1.0;"
+        "\n    var bump_spec = 0.0;"
+        "\n    if (bump_area > 1e-30) {{"
+        "\n        let bump_n = bump_cross * inverseSqrt(bump_area);"
+        "\n        let bump_dp2perp = cross(bump_dp2, bump_n);"
+        "\n        let bump_dp1perp = cross(bump_n, bump_dp1);"
+        "\n        let bump_gu = bump_dp2perp * bump_duvdx.x + bump_dp1perp * bump_duvdy.x;"
+        "\n        let bump_gv = bump_dp2perp * bump_duvdx.y + bump_dp1perp * bump_duvdy.y;"
+        "\n        let bump_tu = bump_gu * inverseSqrt(max(dot(bump_gu, bump_gu), 1e-30));"
+        "\n        let bump_tv = bump_gv * inverseSqrt(max(dot(bump_gv, bump_gv), 1e-30));"
+        "\n        let bump_view = normalize(-in.bump_pos);"
+        "\n        let bump_nf = select(-bump_n, bump_n, dot(bump_n, bump_view) >= 0.0);"
+        "\n        let bump_nb = normalize(bump_nf - bump_slope.x * bump_tu - bump_slope.y * bump_tv);"
+        "\n        let bump_l = vec3f(-0.4472136, 0.5962848, 0.6666667);"
+        "\n        bump_shade = clamp(1.0 + {shade:.6f} * (dot(bump_nb, bump_l) - dot(bump_nf, bump_l)), 0.35, 1.8);",
+        fmt::arg("stage", bumpStage), fmt::arg("c", c), fmt::arg("m", m), fmt::arg("depth", bump.depth),
+        fmt::arg("shade", bump.shade));
+    if (bump.shine > 0.0f) {
+      fragmentFnPre += fmt::format(
+          "\n        let bump_h = normalize(bump_l + bump_view);"
+          "\n        bump_spec = {shine:.6f} * max(pow(max(dot(bump_nb, bump_h), 0.0), 32.0)"
+          "\n            - pow(max(dot(bump_nf, bump_h), 0.0), 32.0), 0.0);",
+          fmt::arg("shine", bump.shine));
+    }
+    fragmentFnPre += "\n    }";
+    fragmentFn += "\n    // Bump mapping\n    prev = vec4f(prev.rgb * bump_shade + vec3f(bump_spec), prev.a);";
   }
   if (info.usesPTTexMtx.any()) {
     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
