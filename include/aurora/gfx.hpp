@@ -206,10 +206,11 @@ void set_cutout_hints(bool enabled) noexcept;
 struct BumpMapping {
   bool enabled = false;
   /// Slope per texel for a full black-to-white step (how deep the relief reads).
-  float depth = 3.0f;
+  float depth = 5.0f;
   /// How much the shading moves the colour: colour x (1 + shade x (N_bump.L - N.L)).
-  float shade = 1.0f;
-  /// Strength of a white highlight where the bumped normal mirrors the light at the eye.
+  float shade = 1.2f;
+  /// Strength of a white highlight where the bumped normal mirrors the light at the eye,
+  /// on steep relief only (rivets, edges, fittings), so gentle grain doesn't turn chalky.
   float shine = 0.0f;
 };
 /// Takes effect for draws recorded after the call; pipelines key on whether a draw is bumped.

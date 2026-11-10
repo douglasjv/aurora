@@ -1600,11 +1600,15 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     const auto& bump = g_bumpMapping;
     uniformPre +=
         "\n"
-        "fn bump_height(t: texture_2d<f32>, s: sampler, uv: vec2f, across: vec2f, bias: f32) -> f32 {\n"
+        "fn bump_height(bump_t: texture_2d<f32>, bump_s: sampler, bump_at: vec2f, bump_across: vec2f,\n"
+        "               bump_lod_bias: f32) -> f32 {\n"
         "    // Two bilinear taps half a texel either side across the slope's direction: a\n"
         "    // little blur, so compression blocks and stair-stepped edges don't read as relief.\n"
-        "    let c = textureSampleBias(t, s, uv + across, bias) + textureSampleBias(t, s, uv - across, bias);\n"
-        "    return dot(c.rgb, vec3f(0.1495, 0.2935, 0.057));\n"
+        "    // (Every name is prefixed: naga's Metal output calls bias() and level() as\n"
+        "    // sampling options, and a parameter called bias shadowed it.)\n"
+        "    let bump_c = textureSampleBias(bump_t, bump_s, bump_at + bump_across, bump_lod_bias)\n"
+        "        + textureSampleBias(bump_t, bump_s, bump_at - bump_across, bump_lod_bias);\n"
+        "    return dot(bump_c.rgb, vec3f(0.1495, 0.2935, 0.057));\n"
         "}";
     fragmentFnPre += fmt::format(
         "\n    // Bump mapping from TEV stage {stage}'s texture"
@@ -1646,7 +1650,8 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     if (bump.shine > 0.0f) {
       fragmentFnPre += fmt::format(
           "\n        let bump_h = normalize(bump_l + bump_view);"
-          "\n        bump_spec = {shine:.6f} * max(pow(max(dot(bump_nb, bump_h), 0.0), 32.0)"
+          "\n        let bump_edge = smoothstep(0.15, 0.45, length(bump_slope));"
+          "\n        bump_spec = {shine:.6f} * bump_edge * max(pow(max(dot(bump_nb, bump_h), 0.0), 32.0)"
           "\n            - pow(max(dot(bump_nf, bump_h), 0.0), 32.0), 0.0);",
           fmt::arg("shine", bump.shine));
     }
