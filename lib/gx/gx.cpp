@@ -469,7 +469,6 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       g_gxState.depthUpdate && g_gxState.colorUpdate && g_gxState.blendMode != GX_BM_SUBTRACT &&
       g_gxState.blendMode != GX_BM_LOGIC &&
       !(g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacDst == GX_BL_ONE) &&
-      !(g_bumpMapping.sceneryOnly && config.shaderConfig.attrs[GX_VA_NRM].attrType != GX_NONE) &&
       bump_source_stage(config.shaderConfig) >= 0) {
     config.shaderConfig.bumpMap = true;
   }

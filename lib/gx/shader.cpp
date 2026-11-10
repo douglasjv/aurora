@@ -1586,7 +1586,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   if (bumpStage >= 0) {
     // Height is the base texture's luminance (bright is raised), its slope taken by central
     // differences one texel apart (or one pixel's footprint, whichever is wider, so distant
-    // and minified surfaces stay calm). The surface frame comes from screen-space
+    // and minified surfaces stay calm), each tap blurred across the slope (two taps half a
+    // texel apart), and steps under 2% of full brightness dropped so compression noise
+    // stays flat. The surface frame comes from screen-space
     // derivatives: the face normal from the position's, and the directions in which u and v
     // grow from the position's and the texcoord's (the cotangent frame), so no vertex
     // tangents or normals are needed. The colour is shaded by how much more or less the
@@ -1598,8 +1600,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     const auto& bump = g_bumpMapping;
     uniformPre +=
         "\n"
-        "fn bump_height(c: vec4f) -> f32 {\n"
-        "    return dot(c.rgb, vec3f(0.299, 0.587, 0.114));\n"
+        "fn bump_height(t: texture_2d<f32>, s: sampler, uv: vec2f, across: vec2f, bias: f32) -> f32 {\n"
+        "    // Two bilinear taps half a texel either side across the slope's direction: a\n"
+        "    // little blur, so compression blocks and stair-stepped edges don't read as relief.\n"
+        "    let c = textureSampleBias(t, s, uv + across, bias) + textureSampleBias(t, s, uv - across, bias);\n"
+        "    return dot(c.rgb, vec3f(0.1495, 0.2935, 0.057));\n"
         "}";
     fragmentFnPre += fmt::format(
         "\n    // Bump mapping from TEV stage {stage}'s texture"
@@ -1610,11 +1615,13 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         "\n    let bump_step = max(bump_texel, max(abs(bump_duvdx), abs(bump_duvdy)));"
         "\n    let bump_su = vec2f(bump_step.x, 0.0);"
         "\n    let bump_sv = vec2f(0.0, bump_step.y);"
-        "\n    let bump_hu = bump_height(textureSampleBias(tex{m}, tex{m}_samp, bump_uv + bump_su, ubuf.tex{m}_size_bias.z))"
-        "\n        - bump_height(textureSampleBias(tex{m}, tex{m}_samp, bump_uv - bump_su, ubuf.tex{m}_size_bias.z));"
-        "\n    let bump_hv = bump_height(textureSampleBias(tex{m}, tex{m}_samp, bump_uv + bump_sv, ubuf.tex{m}_size_bias.z))"
-        "\n        - bump_height(textureSampleBias(tex{m}, tex{m}_samp, bump_uv - bump_sv, ubuf.tex{m}_size_bias.z));"
-        "\n    let bump_slope = vec2f(bump_hu, bump_hv) * ({depth:.6f} * 0.5) * bump_texel / bump_step;"
+        "\n    let bump_hu = bump_height(tex{m}, tex{m}_samp, bump_uv + bump_su, bump_sv * 0.5, ubuf.tex{m}_size_bias.z)"
+        "\n        - bump_height(tex{m}, tex{m}_samp, bump_uv - bump_su, bump_sv * 0.5, ubuf.tex{m}_size_bias.z);"
+        "\n    let bump_hv = bump_height(tex{m}, tex{m}_samp, bump_uv + bump_sv, bump_su * 0.5, ubuf.tex{m}_size_bias.z)"
+        "\n        - bump_height(tex{m}, tex{m}_samp, bump_uv - bump_sv, bump_su * 0.5, ubuf.tex{m}_size_bias.z);"
+        "\n    let bump_raw = vec2f(bump_hu, bump_hv) * 0.5;"
+        "\n    let bump_calm = sign(bump_raw) * max(abs(bump_raw) - vec2f(0.02), vec2f(0.0));"
+        "\n    let bump_slope = bump_calm * {depth:.6f} * bump_texel / bump_step;"
         "\n    let bump_dp1 = dpdx(in.bump_pos);"
         "\n    let bump_dp2 = dpdy(in.bump_pos);"
         "\n    let bump_cross = cross(bump_dp1, bump_dp2);"

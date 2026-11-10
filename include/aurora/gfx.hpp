@@ -206,14 +206,11 @@ void set_cutout_hints(bool enabled) noexcept;
 struct BumpMapping {
   bool enabled = false;
   /// Slope per texel for a full black-to-white step (how deep the relief reads).
-  float depth = 2.0f;
+  float depth = 3.0f;
   /// How much the shading moves the colour: colour x (1 + shade x (N_bump.L - N.L)).
-  float shade = 0.9f;
+  float shade = 1.0f;
   /// Strength of a white highlight where the bumped normal mirrors the light at the eye.
   float shine = 0.0f;
-  /// Leave out draws whose vertices carry normals (the game's lit models: characters,
-  /// props), so only pre-lit scenery gets relief.
-  bool sceneryOnly = false;
 };
 /// Takes effect for draws recorded after the call; pipelines key on whether a draw is bumped.
 void set_bump_mapping(const BumpMapping& settings) noexcept;
