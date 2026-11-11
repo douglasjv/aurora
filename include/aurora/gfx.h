@@ -26,6 +26,9 @@ typedef struct {
   uint32_t lastIndexSize;
   uint32_t lastStorageSize;
   uint32_t lastTextureUploadSize;
+  // Pipelines a draw has asked for that are still compiling. Unlike queuedPipelines,
+  // this leaves out the startup warmup of every pipeline in the pipeline cache.
+  uint32_t requestedPipelines;
 } AuroraStats;
 
 const AuroraStats* aurora_get_stats();

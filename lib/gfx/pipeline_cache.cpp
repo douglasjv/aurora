@@ -333,6 +333,7 @@ static bool register_sdl_vfs() {
 #if defined(__cpp_lib_atomic_ref)
 static std::atomic_ref queuedPipelines{detail::resources().stats.queuedPipelines};
 static std::atomic_ref createdPipelines{detail::resources().stats.createdPipelines};
+static std::atomic_ref requestedPipelines{detail::resources().stats.requestedPipelines};
 #else
 struct AtomicStatRef {
   uint32_t& ref;
@@ -348,6 +349,7 @@ struct AtomicStatRef {
 };
 static AtomicStatRef queuedPipelines{detail::resources().stats.queuedPipelines};
 static AtomicStatRef createdPipelines{detail::resources().stats.createdPipelines};
+static AtomicStatRef requestedPipelines{detail::resources().stats.requestedPipelines};
 #endif
 
 template <typename PipelineConfig>
@@ -389,6 +391,11 @@ enum class PipelinePriority {
   Blocking,   // block until compiled
 };
 
+// The background pipeline the worker is compiling, and whether a draw has since asked
+// for it (so it counts in requestedPipelines until it is done).
+static std::optional<PipelineRef> g_compilingBackground;
+static bool g_compilingBackgroundRequested = false;
+
 static void promote_pending_pipeline(PipelineRef hash, PipelinePriority priority) {
   if (priority == PipelinePriority::Background) {
     return;
@@ -396,6 +403,10 @@ static void promote_pending_pipeline(PipelineRef hash, PipelinePriority priority
 
   auto backgroundIt = find_pending_pipeline(g_backgroundPipelineQueue, hash);
   if (backgroundIt == g_backgroundPipelineQueue.end()) {
+    if (g_compilingBackground == hash && !g_compilingBackgroundRequested) {
+      g_compilingBackgroundRequested = true;
+      ++requestedPipelines;
+    }
     return;
   }
   if (priority == PipelinePriority::Blocking) {
@@ -404,6 +415,7 @@ static void promote_pending_pipeline(PipelineRef hash, PipelinePriority priority
     g_pipelineQueue.emplace_back(std::move(*backgroundIt));
   }
   g_backgroundPipelineQueue.erase(backgroundIt);
+  ++requestedPipelines; // a draw now waits on it
 }
 
 static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
@@ -412,6 +424,7 @@ static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
     PendingPipeline pending = std::move(*priorityIt);
     g_pipelineQueue.erase(priorityIt);
     g_pendingPipelines.erase(hash);
+    --requestedPipelines;
     return pending;
   }
 
@@ -499,9 +512,11 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
         break;
       case PipelinePriority::Normal:
         g_pipelineQueue.emplace_back(std::move(pending));
+        ++requestedPipelines;
         break;
       case PipelinePriority::Blocking:
         g_pipelineQueue.emplace_front(std::move(pending));
+        ++requestedPipelines;
         break;
       }
       g_pendingPipelines.insert(runtimeKey);
@@ -963,6 +978,7 @@ static void pipeline_worker() {
   bool hasMore = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
+    bool requested = false;
     {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
@@ -977,9 +993,14 @@ static void pipeline_worker() {
       if (g_pipelineThreadEnd) {
         break;
       }
-      auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
+      requested = !g_pipelineQueue.empty();
+      auto& source = requested ? g_pipelineQueue : g_backgroundPipelineQueue;
       pending = std::move(source.front());
       source.pop_front();
+      if (!requested) {
+        g_compilingBackground = pending.hash;
+        g_compilingBackgroundRequested = false;
+      }
     }
     auto result = pending.create();
     const auto pipelineCount = result.pipeline_count();
@@ -988,6 +1009,11 @@ static void pipeline_worker() {
       g_pipelines.try_emplace(pending.hash, std::move(result));
       g_pendingPipelines.erase(pending.hash);
       hasMore = !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty();
+      if (requested || (g_compilingBackground == pending.hash && g_compilingBackgroundRequested)) {
+        --requestedPipelines;
+      }
+      g_compilingBackground.reset();
+      g_compilingBackgroundRequested = false;
     }
     if (!g_hasPipelineThread) {
       g_pipelinesPerFrame += std::max(1u, pipelineCount);
@@ -1181,6 +1207,9 @@ void shutdown_pipeline_cache() {
 
   queuedPipelines = 0;
   createdPipelines = 0;
+  requestedPipelines = 0;
+  g_compilingBackground.reset();
+  g_compilingBackgroundRequested = false;
 }
 
 void begin_pipeline_frame() {
