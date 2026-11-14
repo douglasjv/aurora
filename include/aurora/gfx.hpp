@@ -216,6 +216,12 @@ struct BumpMapping {
 /// Takes effect for draws recorded after the call; pipelines key on whether a draw is bumped.
 void set_bump_mapping(const BumpMapping& settings) noexcept;
 
+/// Debug trace of orthographic (2D) draws: appends one tab-separated line per distinct
+/// texture and screen rectangle (640x480 space) to the file at path, with the texture's
+/// replacement-pack name. nullptr or "" turns it off (the default); when off it costs one
+/// branch per draw.
+void set_trace_2d(const char* path) noexcept;
+
 /// Increments on aurora_end_frame.
 uint32_t current_frame() noexcept;
 
