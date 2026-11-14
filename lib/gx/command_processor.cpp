@@ -10,6 +10,7 @@
 #include "regs.hpp"
 #include "shader_info.hpp"
 #include "texture.hpp"
+#include "trace_2d.hpp"
 
 #include <tracy/Tracy.hpp>
 
@@ -507,6 +508,8 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
 
   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
+  if (trace_2d::enabled())
+    UNLIKELY { trace_2d::draw(fmt, vtxCount, vtxSize, vertexData.data()); }
   gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
 
   // Try to merge with previous draw call
@@ -744,6 +747,8 @@ void handle_aurora(ByteReader& reader) noexcept {
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
     const auto vertexData = reader.take(totalVtxBytes);
+    if (trace_2d::enabled())
+      UNLIKELY { trace_2d::draw(fmt, vtxCount, vtxSize, vertexData.data()); }
     const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
     if (indexCount != 0) {
       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
