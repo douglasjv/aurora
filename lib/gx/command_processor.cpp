@@ -8,6 +8,7 @@
 #include "gx.hpp"
 #include "pipeline.hpp"
 #include "regs.hpp"
+#include "replay.hpp"
 #include "shader_info.hpp"
 #include "texture.hpp"
 #include "trace_2d.hpp"
@@ -312,6 +313,9 @@ ProcessResult process(const u8* data, u32 size) noexcept {
       // Check if it's a draw command (0x80-0xBF range)
       if (cmd >= 0x80) {
         handle_draw(cmd, reader);
+      } else if (replay::replaying()) {
+        replay::fail("unknown opcode");
+        return {size, false};
       } else {
         // Hex dump surrounding bytes for debugging
         {
@@ -435,7 +439,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
 
   const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;
   if (!uniformValid) {
+    replay::before_uniform(prim, fmt, vtxCount);
     cache.uniformRange = build_uniform(cache.shaderInfo);
+    replay::after_uniform();
     state.dirty &= ~DirtyUniform;
   }
   if (cache.config.shaderConfig.fogRangeEnabled) {
@@ -499,7 +505,14 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
-    UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
+    UNLIKELY {
+      if (replay::replaying()) {
+        replay::fail("draw overrun");
+        reader.skip(reader.remaining());
+        return;
+      }
+      handle_draw_overrun(totalVtxBytes, reader);
+    }
 
   const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
                           prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
@@ -508,7 +521,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
 
   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
-  if (trace_2d::enabled())
+  if (trace_2d::enabled() && !replay::replaying())
     UNLIKELY { trace_2d::draw(prim, fmt, vtxCount, vtxSize, vertexData.data()); }
   gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
 
@@ -695,7 +708,9 @@ void handle_aurora(ByteReader& reader) noexcept {
   } else if (subCmd == GX_AURORA_LOAD_COPY_DEST) {
     g_gxState.texCopyDest = reinterpret_cast<const void*>(reader.read<u64>());
   } else if (subCmd == GX_AURORA_REQUEST_DEPTH_SNAPSHOT) {
-    gfx::depth_peek::request_snapshot();
+    if (!replay::replaying()) {
+      gfx::depth_peek::request_snapshot();
+    }
   } else if (subCmd == GX_AURORA_BEGIN_OFFSCREEN) {
     const u32 width = reader.read<u32>();
     const u32 height = reader.read<u32>();
@@ -703,11 +718,20 @@ void handle_aurora(ByteReader& reader) noexcept {
   } else if (subCmd == GX_AURORA_END_OFFSCREEN) {
     gfx::end_offscreen();
   } else if (subCmd == GX_AURORA_DESTROY_TEXOBJ) {
-    evict_texture_object(reader.read<u32>());
+    const u32 id = reader.read<u32>();
+    if (!replay::replaying()) { // the first decode evicted it
+      evict_texture_object(id);
+    }
   } else if (subCmd == GX_AURORA_DESTROY_TLUT) {
-    evict_tlut_object(reader.read<u32>());
+    const u32 id = reader.read<u32>();
+    if (!replay::replaying()) {
+      evict_tlut_object(id);
+    }
   } else if (subCmd == GX_AURORA_DESTROY_COPY_TEX) {
-    evict_copy_texture(reinterpret_cast<const void*>(reader.read<u64>()));
+    const auto* dest = reinterpret_cast<const void*>(reader.read<u64>());
+    if (!replay::replaying()) {
+      evict_copy_texture(dest);
+    }
   } else if (subCmd == GX_AURORA_DRAW_SIZED) {
     const u8 cmd = reader.read<u8>();
     const u32 byteLen = reader.read<u32>();
@@ -747,7 +771,7 @@ void handle_aurora(ByteReader& reader) noexcept {
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
     const auto vertexData = reader.take(totalVtxBytes);
-    if (trace_2d::enabled())
+    if (trace_2d::enabled() && !replay::replaying())
       UNLIKELY { trace_2d::draw(prim, fmt, vtxCount, vtxSize, vertexData.data()); }
     const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
     if (indexCount != 0) {
@@ -774,5 +798,21 @@ void clear_draw_cache() noexcept {
   sDrawCache.fogRange = {};
   sDrawCache.hasFogRange = false;
 }
+
+namespace {
+std::array<DrawCache, 2> sSavedDrawCache;
+} // namespace
+
+void save_draw_cache(int slot) noexcept {
+  auto& saved = sSavedDrawCache[slot];
+  saved = sDrawCache;
+  // As clear_draw_cache leaves it between frames: nothing points into a frame's buffers.
+  saved.bindGeneration = 0;
+  saved.uniformRange = {};
+  saved.fogRange = {};
+  saved.hasFogRange = false;
+}
+
+void restore_draw_cache(int slot) noexcept { sDrawCache = sSavedDrawCache[slot]; }
 
 } // namespace aurora::gx::fifo

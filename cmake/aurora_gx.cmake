@@ -17,6 +17,7 @@ add_library(aurora_gx STATIC
         lib/gx/attr_fmt.cpp
         lib/gx/command_processor.cpp
         lib/gx/trace_2d.cpp
+        lib/gx/replay.cpp
         lib/gx/regs.cpp
         lib/gx/dl.cpp
         lib/gx/fifo.cpp

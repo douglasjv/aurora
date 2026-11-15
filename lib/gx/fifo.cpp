@@ -2,6 +2,7 @@
 
 #include "../thread.hpp"
 #include "command_processor.hpp"
+#include "replay.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -260,6 +261,9 @@ void drain() {
   }
   }
 
+  if (replay::capturing()) {
+    replay::append(detail::sBufferData, detail::sBufferSize);
+  }
   {
     std::lock_guard lock{sBufferMutex};
     sStreamBase = target;
@@ -276,6 +280,9 @@ void clear_buffer() {
   AURORA_ASSERT(sPublished.load(std::memory_order_acquire) == processed,
                 "fifo::clear_buffer: published commands are still pending");
   std::lock_guard lock{sBufferMutex};
+  if (replay::capturing()) {
+    replay::append(detail::sBufferData, static_cast<u32>(processed - sStreamBase));
+  }
   sStreamBase = processed;
   detail::sBufferSize = 0;
   sPendingDraws = 0;

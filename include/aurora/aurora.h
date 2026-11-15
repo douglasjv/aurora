@@ -131,6 +131,9 @@ void aurora_shutdown();
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();
+// aurora_end_frame, presenting the frame only when present is true (a hidden frame is
+// drawn and submitted, so its EFB copies and captures happen, but never shown).
+void aurora_end_frame_present(bool present);
 
 void aurora_set_log_level(AuroraLogLevel level);
 void aurora_set_pause_on_focus_lost(bool value);
