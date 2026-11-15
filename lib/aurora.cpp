@@ -261,7 +261,7 @@ bool begin_frame() noexcept {
   return true;
 }
 
-void end_frame() noexcept {
+void end_frame(bool present = true) noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   gx::fifo::drain();
@@ -285,7 +285,7 @@ void end_frame() noexcept {
   }
 #endif
 
-  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
+  gfx::end_frame([present, rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
                   imguiDrawData = std::move(imguiDrawData)](
                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
     wgpu::Texture currentTexture;
@@ -293,7 +293,7 @@ void end_frame() noexcept {
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
     {
       window::SurfaceLock surfaceLock;
-      if (window::is_presentable() && g_surface) {
+      if (present && window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
         wgpu::SurfaceTexture surfaceTexture;
         g_surface.GetCurrentTexture(&surfaceTexture);
@@ -363,7 +363,7 @@ void end_frame() noexcept {
         imgui::render(pass, imguiDrawData);
         pass.End();
       }
-    } else {
+    } else if (present) {
       Log.info("Skipping present; window not presentable");
     }
     webgpu::gpu_prof::frame_end(encoder);
@@ -389,7 +389,7 @@ void end_frame() noexcept {
         Log.warn("Surface present failed");
         webgpu::release_surface();
       }
-    } else if (g_surface) {
+    } else if (present && g_surface) {
       switch (surfaceStatus) {
       case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
         Log.warn("Surface texture acquisition timed out");
@@ -454,6 +454,7 @@ void aurora_shutdown() { aurora::shutdown(); }
 const AuroraEvent* aurora_update() { return aurora::update(); }
 bool aurora_begin_frame() { return aurora::begin_frame(); }
 void aurora_end_frame() { aurora::end_frame(); }
+void aurora_end_frame_present(bool present) { aurora::end_frame(present); }
 SDL_Window* aurora_get_window() { return aurora::window::get_sdl_window(); }
 AuroraWindowSize aurora_get_window_size() {
   return aurora::window::get_sdl_window() != nullptr ? aurora::window::get_window_size() : AuroraWindowSize{};
