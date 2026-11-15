@@ -115,6 +115,7 @@ bool sRecording = false;
 bool sReplaying = false;
 bool sFailed = false;
 bool sReady = false; // a closed tick waits to be replayed
+bool sSkip = false;  // the kept tick drew outside the stream (aurora_replay_skip_tick)
 bool sCut = false;
 bool sSwapped = false;
 float sBlend = 1.f;
@@ -866,6 +867,7 @@ void aurora_replay_begin_tick() {
     return;
   }
   sReady = false;
+  sSkip = false;
   sPrevious = std::move(sCurrent);
   sCurrent.clear();
   sPrevDraws = std::move(sDraws);
@@ -906,7 +908,7 @@ void aurora_end_frame_hidden() {
 }
 
 bool aurora_replay_draw(float blend) {
-  if (!sReady) {
+  if (!sReady || sSkip) {
     return false;
   }
   // Commands the game wrote after the tick closed (between ticks) belong after its end
@@ -938,6 +940,13 @@ void aurora_replay_end_tick() {
   g_gxState = *sEnd;
   fifo::restore_draw_cache(1);
   sReady = false;
+}
+
+void aurora_replay_skip_tick() {
+  if (sRecording && !sSkip) {
+    sSkip = true;
+    ++sStats.ticksSkipped;
+  }
 }
 
 bool aurora_replay_reads(const void* data, size_t size) {

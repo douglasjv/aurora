@@ -1,5 +1,7 @@
 #include "command_processor.hpp"
 
+#include <aurora/gfx.hpp>
+
 #include "../gfx/depth_peek.hpp"
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
@@ -724,6 +726,12 @@ void handle_aurora(ByteReader& reader) noexcept {
     const u32 height = reader.read<u32>();
     gfx::begin_offscreen(width, height);
   } else if (subCmd == GX_AURORA_END_OFFSCREEN) {
+    if (replay::replaying() && !gfx::is_offscreen()) {
+      // The pass was opened outside the stream (aurora::gfx::create_pass), so the replay
+      // never saw it begin: stop the replay rather than close a pass that is not open.
+      replay::fail("an offscreen pass ends that the stream did not open");
+      return;
+    }
     gfx::end_offscreen();
   } else if (subCmd == GX_AURORA_DESTROY_TEXOBJ) {
     const u32 id = reader.read<u32>();
