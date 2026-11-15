@@ -856,6 +856,17 @@ void handle_aurora(ByteReader& reader) noexcept {
   } else if (subCmd == GX_AURORA_DEBUG_MARKER_INSERT) {
     auto label = reader.read_string();
     gfx::insert_debug_marker(std::move(label));
+  } else if (subCmd == GX_AURORA_REPLAY_VIEW) {
+    std::array<f32, 12> view{};
+    const bool has = reader.read<u8>() != 0;
+    if (has) {
+      for (auto& v : view) {
+        v = reader.read<f32>();
+      }
+    }
+    replay::on_view(has ? view.data() : nullptr);
+  } else if (subCmd == GX_AURORA_REPLAY_TASK) {
+    replay::on_task(reader.read<u64>());
   }
 
   else {
