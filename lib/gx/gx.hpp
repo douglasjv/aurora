@@ -88,7 +88,9 @@ struct DrawImmediateData {
   u32 vtxStart = 0;
   u32 currentPnMtx = 0;
   u32 fogRangeBase = 0;
-  u32 _pad = 0;
+  // A float's bits: the share of its colour a replay's crossfade takes from the draw (0, none;
+  // read only by shaders with ShaderConfig::fade).
+  u32 fade = 0;
   std::array<u32, MaxIndexAttr> arrayStart{};
 };
 static_assert(std::has_unique_object_representations_v<DrawImmediateData>);
@@ -307,6 +309,10 @@ struct AttrArray {
   u8 stride;
   bool le = true;
   gfx::Range cachedRange;
+  // A replay pushed this array (at cachedRange) blended, as floats: its type (GX_F32) and
+  // stride then, or 0xFF. Read only while cachedRange is set.
+  u8 replayType = 0xFF;
+  u8 replayStride = 0;
 };
 inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
   return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;
@@ -504,7 +510,8 @@ struct ShaderConfig {
   u8 toonLighting : 1 = false; // aurora::gfx::set_toon_lighting: per-pixel lighting in bands
   u8 cutoutHint : 1 = false;   // aurora::gfx::set_cutout_hints and an alpha test: normal alpha 1/3
   u8 bumpMap : 1 = false;      // aurora::gfx::set_bump_mapping and a bump source (bump_source_stage)
-  u8 pad1 : 2 = 0;
+  u8 fade : 1 = false;         // replay crossfade on an additive draw: colour scaled by DrawImmediateData::fade
+  u8 pad1 : 1 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;

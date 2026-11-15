@@ -1,6 +1,7 @@
 #include "gx.hpp"
 
 #include "pipeline.hpp"
+#include "replay.hpp"
 #include "texture.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../webgpu/gpu.hpp"
@@ -415,15 +416,20 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       break;
     }
     case GX_INDEX8:
-      mapping.stride = g_gxState.arrays[i].stride;
-      mapping.le = g_gxState.arrays[i].le;
-      vtxOffset += nbt3 ? 3 : 1;
+    case GX_INDEX16: {
+      const auto& array = g_gxState.arrays[i];
+      mapping.stride = array.stride;
+      mapping.le = array.le;
+      if (array.replayType != 0xFF && array.cachedRange.size != 0) {
+        // A replay's blended array, pushed as floats (replay::array_bytes).
+        mapping.compType = array.replayType;
+        mapping.stride = array.replayStride;
+        mapping.frac = 0;
+        mapping.le = true;
+      }
+      vtxOffset += type == GX_INDEX8 ? (nbt3 ? 3 : 1) : (nbt3 ? 6 : 2);
       break;
-    case GX_INDEX16:
-      mapping.stride = g_gxState.arrays[i].stride;
-      mapping.le = g_gxState.arrays[i].le;
-      vtxOffset += nbt3 ? 6 : 2;
-      break;
+    }
     default:
       Log.fatal("populate_pipeline_config: Invalid vertex type {}", type);
     }
@@ -464,6 +470,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   if (g_gxState.alphaCompare) {
     config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
     config.shaderConfig.cutoutHint = g_cutoutHints;
+  }
+  if (g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacDst == GX_BL_ONE && replay::crossfade_enabled()) {
+    config.shaderConfig.fade = true;
   }
   if (g_bumpMapping.enabled && g_gxState.projType == GX_PERSPECTIVE && config.shaderConfig.lineMode == 0 &&
       g_gxState.depthUpdate && g_gxState.colorUpdate && g_gxState.blendMode != GX_BM_SUBTRACT &&
