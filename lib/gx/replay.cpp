@@ -487,16 +487,27 @@ M lerp(const M& a, const M& b, float t) noexcept {
   return out;
 }
 
-// A 3x4 matrix blended from a to b: the translation straight across, the 3x3 part as a
-// rotation (slerp) times a stretch (lerp) from their polar decompositions, so a turning
-// thing keeps its size halfway. Element by element when either part cannot be decomposed
-// (singular), when one mirrors and the other does not, or with rotation=0.
-Mat3x4<float> blend_matrix(const Mat3x4<float>& a, const Mat3x4<float>& b, float t) noexcept {
+// How a 3x4 matrix blends from a to b, worked out once when the tick closes: the
+// translation straight across, the 3x3 part as a rotation (slerp) times a stretch (lerp)
+// from their polar decompositions, so a turning thing keeps its size halfway. Element by
+// element when either part cannot be decomposed (singular), when one mirrors and the
+// other does not, or with rotation=0.
+struct Turn {
+  u8 kind = 0; // 0 the same, 1 element by element, 2 turn
+  std::array<float, 4> qa{};
+  std::array<float, 4> qb{};
+  M3 sa{};
+  M3 sb{};
+};
+
+Turn prepare_turn(const Mat3x4<float>& a, const Mat3x4<float>& b) noexcept {
+  Turn turn;
   if (std::memcmp(&a, &b, sizeof(a)) == 0) {
-    return b;
+    return turn;
   }
+  turn.kind = 1;
   if (sTunables.rotation == 0.f) {
-    return lerp(a, b, t);
+    return turn;
   }
   float fa[12];
   float fb[12];
@@ -507,11 +518,11 @@ Mat3x4<float> blend_matrix(const Mat3x4<float>& a, const Mat3x4<float>& b, float
   M3 ra;
   M3 rb;
   if (!polar_rotation(ma, ra) || !polar_rotation(mb, rb)) {
-    return lerp(a, b, t);
+    return turn;
   }
   const bool mirrorA = det3(ra) < 0.f;
   if (mirrorA != (det3(rb) < 0.f)) {
-    return lerp(a, b, t);
+    return turn;
   }
   if (mirrorA) { // m = (-R)(-S), -R a proper rotation
     for (int i = 0; i < 9; ++i) {
@@ -519,8 +530,7 @@ Mat3x4<float> blend_matrix(const Mat3x4<float>& a, const Mat3x4<float>& b, float
       rb[i] = -rb[i];
     }
   }
-  // S = R^T m for each; the result is R(t) lerp(Sa, Sb, t), exact at both ends.
-  M3 s;
+  // S = R^T m for each; the blend is R(t) lerp(Sa, Sb, t), exact at both ends.
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 3; ++c) {
       float sa = 0.f;
@@ -529,10 +539,32 @@ Mat3x4<float> blend_matrix(const Mat3x4<float>& a, const Mat3x4<float>& b, float
         sa += ra[k * 3 + r] * ma[k * 3 + c];
         sb += rb[k * 3 + r] * mb[k * 3 + c];
       }
-      s[r * 3 + c] = sa + (sb - sa) * t;
+      turn.sa[r * 3 + c] = sa;
+      turn.sb[r * 3 + c] = sb;
     }
   }
-  const M3 rt = from_quat(slerp(to_quat(ra), to_quat(rb), t));
+  turn.qa = to_quat(ra);
+  turn.qb = to_quat(rb);
+  turn.kind = 2;
+  return turn;
+}
+
+Mat3x4<float> blend_matrix(const Mat3x4<float>& a, const Mat3x4<float>& b, const Turn& turn, float t) noexcept {
+  if (turn.kind == 0) {
+    return b;
+  }
+  if (turn.kind == 1) {
+    return lerp(a, b, t);
+  }
+  float fa[12];
+  float fb[12];
+  std::memcpy(fa, &a, sizeof(fa));
+  std::memcpy(fb, &b, sizeof(fb));
+  M3 s;
+  for (int i = 0; i < 9; ++i) {
+    s[i] = turn.sa[i] + (turn.sb[i] - turn.sa[i]) * t;
+  }
+  const M3 rt = from_quat(slerp(turn.qa, turn.qb, t));
   float out[12];
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 3; ++c) {
@@ -548,6 +580,9 @@ Mat3x4<float> blend_matrix(const Mat3x4<float>& a, const Mat3x4<float>& b, float
   std::memcpy(static_cast<void*>(&m), out, sizeof(out));
   return m;
 }
+
+// Each record's turns from its match, position matrices then normal matrices, by record.
+std::vector<std::array<Turn, 2 * MaxPnMtx>> sTurns;
 
 // A 3x4 matrix as twelve floats, row major: rows x, y, z, each three basis components
 // and a translation.
@@ -1209,6 +1244,18 @@ void match() noexcept {
     r.match = best;
     ++matched;
   }
+  sTurns.resize(sCurrent.size());
+  for (size_t i = 0; i < sCurrent.size(); ++i) {
+    const auto& r = sCurrent[i];
+    if (r.match < 0) {
+      continue;
+    }
+    const auto& prev = sPrevious[r.match];
+    for (u32 k = 0; k < MaxPnMtx; ++k) {
+      sTurns[i][k] = prepare_turn(prev.m.pos[k], r.m.pos[k]);
+      sTurns[i][MaxPnMtx + k] = prepare_turn(prev.m.nrm[k], r.m.nrm[k]);
+    }
+  }
   if (sTunables.debug != 0.f) {
     float moved = 0.f;
     float projMoved = 0.f;
@@ -1522,9 +1569,10 @@ void before_uniform(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount) noexcept {
   // Blend from where the draw was a tick ago (t = 0) to where it is now (t = 1).
   const float t = sBlend;
   auto& state = g_gxState;
+  const auto& turns = sTurns[it->second];
   for (u32 i = 0; i < MaxPnMtx; ++i) {
-    state.pnMtx[i].pos = blend_matrix(prev.m.pos[i], cur.m.pos[i], t);
-    state.pnMtx[i].nrm = blend_matrix(prev.m.nrm[i], cur.m.nrm[i], t);
+    state.pnMtx[i].pos = blend_matrix(prev.m.pos[i], cur.m.pos[i], turns[i], t);
+    state.pnMtx[i].nrm = blend_matrix(prev.m.nrm[i], cur.m.nrm[i], turns[MaxPnMtx + i], t);
   }
   state.proj = lerp(prev.m.proj, cur.m.proj, t);
   if (sTunables.colors != 0.f) {
@@ -1589,6 +1637,7 @@ void aurora_replay_enable(bool enabled) {
     sPrevPositions = {};
     sRaw = {};
     sPrevRaw = {};
+    sTurns = {};
     sReads = {};
     sReadSet = {};
     sStart.reset();
