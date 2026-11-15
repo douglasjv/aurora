@@ -67,6 +67,14 @@ typedef struct {
   uint32_t drawsRejected; // paired, but moved too far to blend
   uint32_t drawsBlended;  // draws whose positions were blended, all replays so far
   uint32_t ticksSkipped;  // ticks not replayed because something drew outside the stream, so far
+  // Of the paired position draws of the last closed tick, those that turned as a rigid body
+  // (a propeller): blended along the turn rather than straight across it.
+  uint32_t drawsRigid;
+  // Uniform builds whose colours, fog or texture matrices were blended, all replays so far
+  // (each of those is also in blended).
+  uint32_t looksBlended;
+  // Position draws whose vertex colours were blended (the screen fade), all replays so far.
+  uint32_t colorsBlended;
 } AuroraReplayStats;
 
 void aurora_replay_enable(bool enabled);
@@ -86,7 +94,9 @@ bool aurora_replay_reads(const void* data, size_t size);
 // it is.
 void aurora_replay_skip_tick();
 // maxturn, jumprel, jumpabs, cutmin, cutfraction, nearestmax, blend (0 draws replays unblended),
-// vertices (0 leaves positions in the stream unblended), debug.
+// vertices (0 leaves positions in the stream unblended), rotation (0 blends matrices element by
+// element), rigid (the residual a turning draw may have, 0 never turns), rigidmin (degrees),
+// colors (0 leaves colours, fog and texture matrices unblended), colormax, texjump, debug.
 bool aurora_replay_set_tunable(const char* name, float value);
 const AuroraReplayStats* aurora_replay_stats();
 
