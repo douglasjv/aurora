@@ -525,7 +525,8 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   const auto vertexData = reader.take(totalVtxBytes);
   if (trace_2d::enabled() && !replay::replaying())
     UNLIKELY { trace_2d::draw(prim, fmt, vtxCount, vtxSize, vertexData.data()); }
-  gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
+  const u8* vertices = replay::vertices(prim, fmt, vtxCount, vtxSize, vertexData.data());
+  gfx::Range vertRange = gfx::push_verts(vertices, vertexData.size(), canMerge ? 0 : 4);
 
   // Try to merge with previous draw call
   if (canMerge) {
@@ -780,7 +781,8 @@ void handle_aurora(ByteReader& reader) noexcept {
     const auto vertexData = reader.take(totalVtxBytes);
     if (trace_2d::enabled() && !replay::replaying())
       UNLIKELY { trace_2d::draw(prim, fmt, vtxCount, vtxSize, vertexData.data()); }
-    const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+    const u8* vertices = replay::vertices(prim, fmt, vtxCount, vtxSize, vertexData.data());
+    const gfx::Range vertRange = gfx::push_verts(vertices, vertexData.size(), 4);
     if (indexCount != 0) {
       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
     }

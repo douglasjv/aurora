@@ -59,6 +59,13 @@ typedef struct {
   uint32_t blended;  // draws blended, all replays so far
   uint32_t unknown;  // replayed uniform builds with no record, all replays so far
   uint32_t replays;  // replays so far
+  // Draws with positions in the stream (the game transformed them on the CPU): their
+  // positions are blended the same way, pairing each with the previous tick's draw of the
+  // same format, primitive, vertex count and texture coordinates, nearest first.
+  uint32_t draws;         // such draws in the last closed tick
+  uint32_t drawsMatched;  // of those, paired with one from the tick before
+  uint32_t drawsRejected; // paired, but moved too far to blend
+  uint32_t drawsBlended;  // draws whose positions were blended, all replays so far
 } AuroraReplayStats;
 
 void aurora_replay_enable(bool enabled);
@@ -71,7 +78,8 @@ void aurora_replay_end_tick();
 // size) (vertex arrays, indexed matrix loads, textures, TLUTs), so its replays would read
 // it again: a block the game freed during the tick matters only if this is true.
 bool aurora_replay_reads(const void* data, size_t size);
-// maxturn, jumprel, jumpabs, cutmin, cutfraction, nearestmax, blend (0 draws replays unblended).
+// maxturn, jumprel, jumpabs, cutmin, cutfraction, nearestmax, blend (0 draws replays unblended),
+// vertices (0 leaves positions in the stream unblended), debug.
 bool aurora_replay_set_tunable(const char* name, float value);
 const AuroraReplayStats* aurora_replay_stats();
 

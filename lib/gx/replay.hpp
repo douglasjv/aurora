@@ -30,6 +30,12 @@ bool failed() noexcept;
 // arrays, indexed matrix loads, textures, TLUTs): a replay may read them again.
 void note_read(const void* data, size_t size) noexcept;
 
+// A draw's vertex bytes as the FIFO holds them: on the first decode, records the
+// positions of a draw that has them in the stream (GX_DIRECT); on a replay, returns the
+// bytes with those positions blended toward the previous tick's matching draw (in a buffer
+// valid until the next call), or `data` itself.
+const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* data) noexcept;
+
 // Around build_uniform: records the draw's matrices (first decode) or swaps in the
 // blended ones (replay). after_uniform puts the state's matrices back.
 void before_uniform(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount) noexcept;
