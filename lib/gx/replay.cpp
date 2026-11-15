@@ -204,6 +204,16 @@ Tunables sTunables;
 AuroraReplayStats sStats{};
 
 std::vector<u8> sCapture;
+// The kept tick's marks (aurora_replay_mark): where in sCapture, the callback, and its
+// payload's place in sMarkBytes.
+struct Mark {
+  size_t offset;
+  AuroraReplayMarkCallback callback;
+  u32 data;
+  u32 size;
+};
+std::vector<Mark> sMarks;
+std::vector<u8> sMarkBytes;
 std::vector<Record> sCurrent;
 std::vector<Record> sPrevious;
 std::vector<DrawRecord> sDraws;
@@ -1564,16 +1574,31 @@ void merge_reads() noexcept {
   sReadSet.clear();
 }
 
-void decode(const std::vector<u8>& bytes) noexcept {
-  size_t offset = 0;
-  while (offset < bytes.size() && !sFailed) {
-    const auto result = fifo::process(bytes.data() + offset, static_cast<u32>(bytes.size() - offset));
+// Decodes bytes [offset, end) of the kept stream.
+void decode_range(const std::vector<u8>& bytes, size_t offset, size_t end) noexcept {
+  while (offset < end && !sFailed) {
+    const auto result = fifo::process(bytes.data() + offset, static_cast<u32>(end - offset));
     if (result.bytesProcessed == 0) {
       fail("no progress");
       break;
     }
     offset += result.bytesProcessed; // a draw-done ends a run here and is otherwise ignored
   }
+}
+
+// Decodes the kept stream, running each mark's callback where the first decode met it.
+void decode(const std::vector<u8>& bytes) noexcept {
+  size_t offset = 0;
+  for (const auto& mark : sMarks) {
+    decode_range(bytes, offset, mark.offset);
+    if (sFailed) {
+      return;
+    }
+    offset = mark.offset;
+    mark.callback(sMarkBytes.data() + mark.data, mark.size);
+    ++sStats.marksReplayed;
+  }
+  decode_range(bytes, offset, bytes.size());
 }
 } // namespace
 
@@ -2044,6 +2069,8 @@ void aurora_replay_enable(bool enabled) {
   if (!enabled) {
     sCapturing = sRecording = sReady = false;
     sCapture = {};
+    sMarks = {};
+    sMarkBytes = {};
     sCurrent = {};
     sPrevious = {};
     sCurrentByHash = {};
@@ -2091,6 +2118,8 @@ void aurora_replay_begin_tick() {
   sUvUnpaired = 0;
   sCurrentByHash.clear();
   sCapture.clear();
+  sMarks.clear();
+  sMarkBytes.clear();
   sReads.clear();
   sReadSet.clear();
   sStart = snapshot();
@@ -2161,6 +2190,18 @@ void aurora_replay_skip_tick() {
     sSkip = true;
     ++sStats.ticksSkipped;
   }
+}
+
+void aurora_replay_mark(AuroraReplayMarkCallback callback, const void* data, size_t size) {
+  if (!sCapturing || callback == nullptr || size > 256 || (size != 0 && data == nullptr)) {
+    return;
+  }
+  // Everything the game wrote before the mark is decoded (and so kept) before it.
+  fifo::drain();
+  const auto at = static_cast<u32>(sMarkBytes.size());
+  const auto* bytes = static_cast<const u8*>(data);
+  sMarkBytes.insert(sMarkBytes.end(), bytes, bytes + size);
+  sMarks.push_back({sCapture.size(), callback, at, static_cast<u32>(size)});
 }
 
 bool aurora_replay_reads(const void* data, size_t size) {

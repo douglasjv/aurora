@@ -94,6 +94,8 @@ typedef struct {
   // Flipbook draws drawn twice, the previous tick's cell and this one's cross-faded
   // (crossfade=1), all replays so far.
   uint32_t crossfaded;
+  // Marks (aurora_replay_mark) whose callback a replay ran, all replays so far.
+  uint32_t marksReplayed;
 } AuroraReplayStats;
 
 void aurora_replay_enable(bool enabled);
@@ -112,6 +114,16 @@ bool aurora_replay_reads(const void* data, size_t size);
 // and could rebuild a copied texture without it: the tick is not replayed, and is shown as
 // it is.
 void aurora_replay_skip_tick();
+// A pass the game's side draws by calling the renderer directly (aurora::gfx::resolve_pass,
+// push_encoder_task, push_custom_draw: the port's cel-shading outlines and bloom), at a
+// point of the tick that the replays should repeat. Called just before that drawing, while
+// a tick is kept, it drains the FIFO and marks the stream there with `callback` and a copy
+// of `size` bytes at `data` (at most 256); each replay calls callback(copy, size) when its
+// decode reaches the mark, to draw the pass again over the replayed picture. Outside a kept
+// tick it does nothing. The callback must draw only from the renderer and its copy, not
+// from game state, which has moved on by the time a replay runs.
+typedef void (*AuroraReplayMarkCallback)(const void* data, size_t size);
+void aurora_replay_mark(AuroraReplayMarkCallback callback, const void* data, size_t size);
 // maxturn, jumprel, jumpabs, cutmin, cutfraction, nearestmax, blend (0 draws replays unblended),
 // vertices (0 leaves positions in the stream unblended), rotation (0 blends matrices element by
 // element), rigid (the residual a turning draw may have, 0 never turns), rigidmin (degrees),
