@@ -96,6 +96,14 @@ typedef struct {
   uint32_t crossfaded;
   // Marks (aurora_replay_mark) whose callback a replay ran, all replays so far.
   uint32_t marksReplayed;
+  // The last closed tick's distinct views (aurora_replay_view), tasks that drew
+  // (aurora_replay_task), and draws made inside a task and under a view.
+  uint32_t views;
+  uint32_t tasks;
+  uint32_t drawsInTask;
+  uint32_t drawsUnderView;
+  // Uniform builds a replay placed (another camera, a moved or hidden task), all replays so far.
+  uint32_t drawsPlaced;
 } AuroraReplayStats;
 
 void aurora_replay_enable(bool enabled);
@@ -111,6 +119,32 @@ bool aurora_replay_draw(float blend);
 // pair that moved too far and a cut tick are shown as the tick has them, as by
 // aurora_replay_draw. aurora_replay_draw(b) is aurora_replay_draw_at(b, b).
 bool aurora_replay_draw_at(float motion, float looks);
+
+// Views and tasks: what each draw of the kept tick was drawn under and by whom, so a replay
+// can draw part of the scene from another camera, or move or leave out one task's draws
+// (skies-eternal's docs/design/true-high-fps.md, step 2: the live player and camera, the live
+// battle leader and slow motion stand on these). All of it is off until a call asks for it.
+//
+// aurora_replay_view, while a tick is kept: the game's camera from here on, the 3x4 row-major
+// world-to-view matrix its models are multiplied by (null: none). A draw made under a
+// perspective projection after it is under that view; an orthographic one (the HUD, menus)
+// never is. The same matrix marked again is the same view.
+void aurora_replay_view(const float* view);
+// aurora_replay_task, while a tick is kept: the task whose draws follow (any non-zero id the
+// caller chooses; 0 none), until the next call.
+void aurora_replay_task(uint64_t task);
+// For the kept tick's replays (cleared when the next tick begins): leave out a task's draws,
+// or draw them moved by `world` (3x4 row major, applied in world space before the camera;
+// null stops). Only draws under a view can move.
+void aurora_replay_hide_task(uint64_t task, bool hidden);
+void aurora_replay_move_task(uint64_t task, const float* world);
+// For the replays from now on: draw the draws under the kept tick's last view as if the
+// camera were `view` (world to view, 3x4 row major; null: the replay's own camera). The tick's
+// own view leaves every draw exactly as it is. Lights move with the camera; the projection
+// does not change.
+void aurora_replay_set_camera(const float* view);
+// Draws the task made in the last closed tick.
+uint32_t aurora_replay_task_draws(uint64_t task);
 void aurora_replay_end_tick();
 // Whether the last closed tick's first decode read game memory overlapping [data, data +
 // size) (vertex arrays, indexed matrix loads, textures, TLUTs), so its replays would read
@@ -132,6 +166,7 @@ void aurora_replay_skip_tick();
 // from game state, which has moved on by the time a replay runs.
 typedef void (*AuroraReplayMarkCallback)(const void* data, size_t size);
 void aurora_replay_mark(AuroraReplayMarkCallback callback, const void* data, size_t size);
+// camera (1: draws under a view blend in world space and the camera on its own), forceview,
 // maxturn, jumprel, jumpabs, cutmin, cutfraction, nearestmax, blend (0 draws replays unblended),
 // vertices (0 leaves positions in the stream unblended), rotation (0 blends matrices element by
 // element), rigid (the residual a turning draw may have, 0 never turns), rigidmin (degrees),
