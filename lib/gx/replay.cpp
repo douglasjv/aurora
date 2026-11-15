@@ -73,6 +73,11 @@ struct Record {
   Matrices m;
   Look look;
   s32 match = -1; // index of the previous tick's record it blends from
+  // debug=1: what else the draw read, to find what changes between ticks that is not
+  // blended (indexed texture coordinates, indexed colours, textures).
+  u64 uvData = 0;
+  u64 clrData = 0;
+  u64 textures = 0;
 };
 
 // A draw with its positions in the stream (CPU-transformed geometry), as the first decode
@@ -114,6 +119,29 @@ struct DrawRecord {
   float angle = 0.f;
   float pivot[3] = {};
   float slide = 0.f;
+  // Texture coordinates in the stream (GX_DIRECT), the first four.
+  u8 uvCount = 0;
+  u8 uvType[4] = {};
+  u8 uvFrac[4] = {};
+  u8 uvComps[4] = {}; // 1 or 2
+  u32 uvOffset[4] = {};
+  u64 texHash = 0;       // the textures its TEV stages sample
+  const void* tex0 = nullptr; // the first of them (debug logging)
+  u8 stages = 0;
+  u32 texFirst = 0; // an additive draw's textures in sDrawTextures (or sPrevDrawTextures)
+  u8 texCount = 0;
+  bool additive = false; // added onto what is drawn (blend destination factor one)
+  // Set when the tick closes, for a paired draw: how its texture coordinates changed.
+  u8 uvMode = 0;
+};
+
+// How a paired draw's texture coordinates in the stream changed between ticks.
+enum UvMode : u8 {
+  UvSame,    // not at all (or the draw has none)
+  UvMoved,   // by a little (a scroll, a wrap taken the short way): blended
+  UvStepped, // all by the same offset, at least half the draw's extent: a flipbook's next cell
+  UvSwapped, // it samples another texture: a flipbook of textures
+  UvJumped,  // by more than texjump, or laid out differently: shown as it is
 };
 
 struct Tunables {
@@ -155,6 +183,11 @@ struct Tunables {
   // A texture matrix whose translation moves by more than this (in texture widths, after
   // taking a wrap the short way) jumped (a flipbook) and is not blended.
   float texJump = 0.25f;
+  // 0 leaves texture coordinates in the stream unblended.
+  float uvs = 1.f;
+  // 1 draws an additive flipbook draw twice, the previous tick's cell faded out and this one's
+  // faded in; 0 shows the cell as it is.
+  float crossfade = 0.f;
 };
 
 bool sEnabled = false;
@@ -179,9 +212,29 @@ std::vector<float> sPositions;
 std::vector<float> sPrevPositions;
 u32 sDrawIndex = 0; // the next direct-position draw of the decode
 u32 sStillPaired = 0; // position draws of the last closed tick paired because they did not move
+u32 sUvUnpaired = 0;  // draws of the tick being kept with coordinates but indexed positions
 std::vector<u8> sRaw;     // the vertices of this tick's position draws, as the stream held them
 std::vector<u8> sPrevRaw; // ... and the previous tick's
 std::vector<u8> sVertexScratch;
+// The texture coordinate arrays (indexed) the tick's first decode read, by address: their
+// bytes, and the previous tick's.
+struct ArrayCopy {
+  u32 offset;
+  u32 size;
+};
+constexpr u32 MaxArrayCopy = 256 * 1024;
+absl::flat_hash_map<const void*, ArrayCopy> sArrays;
+absl::flat_hash_map<const void*, ArrayCopy> sPrevArrays;
+std::vector<u8> sArrayBytes;
+std::vector<u8> sPrevArrayBytes;
+std::vector<u8> sArrayScratch;
+std::vector<u8> sCrossScratch; // a cross-faded draw's vertices with the previous tick's cell
+bool sCrossPending = false;
+std::vector<PreviousTexture> sDrawTextures;     // the additive draws' textures, this tick
+std::vector<PreviousTexture> sPrevDrawTextures; // ... and the previous tick's
+const DrawRecord* sCrossPrev = nullptr;          // the cross-faded draw's match
+bool sTexturesPending = false; // the last draw recorded waits for its textures (note_draw_textures)    // vertices() made sCrossScratch for the draw it returned
+float sCrossWeight = 1.f;
 // The first decode's records by the hash of their key and matrices: a replay recomputes
 // the hash from the same state and finds its record without relying on build order.
 absl::flat_hash_map<u64, u32> sCurrentByHash;
@@ -721,6 +774,13 @@ bool position_layout(GXVtxFmt fmt, DrawRecord& r, u32& uvOffset) noexcept {
       r.clrType[r.clrCount] = static_cast<u8>(attrFmt.type);
       ++r.clrCount;
     }
+    if (i >= GX_VA_TEX0 && desc == GX_DIRECT && r.uvCount < 4) {
+      r.uvOffset[r.uvCount] = offset;
+      r.uvType[r.uvCount] = static_cast<u8>(attrFmt.type);
+      r.uvFrac[r.uvCount] = attrFmt.frac;
+      r.uvComps[r.uvCount] = static_cast<u8>(comp_cnt_count(attr, attrFmt.cnt));
+      ++r.uvCount;
+    }
     if (i == GX_VA_POS && desc == GX_DIRECT) {
       direct = true;
       r.posOffset = offset;
@@ -1002,6 +1062,77 @@ void fit_rigid(DrawRecord& cur, const DrawRecord& prev) noexcept {
   cur.rigid = true;
 }
 
+// A texture coordinate's component as the stream holds it, and back.
+const u8* uv_at(const u8* vertex, const DrawRecord& r, u32 k, u32 c) noexcept {
+  const u8 size = r.uvType[k] == GX_F32 ? 4 : r.uvType[k] >= GX_U16 ? 2 : 1;
+  return vertex + r.uvOffset[k] + c * size;
+}
+
+// A change in texture coordinates taken the short way round a wrap (-0.5 to 0.5 of the
+// texture).
+float short_way(float d) noexcept { return d - std::round(d); }
+
+// How a paired draw's texture coordinates in the stream changed from its match (UvMode).
+// A scroll moves them a little; a flipbook steps every vertex by the same whole cell (at
+// least half the draw's extent: a particle's quad spans one cell) or swaps the texture.
+u8 uv_mode(const DrawRecord& cur, const DrawRecord& prev) noexcept {
+  if (cur.texHash != prev.texHash) {
+    return UvSwapped;
+  }
+  if (cur.uvCount == 0) {
+    return UvSame;
+  }
+  if (cur.uvCount != prev.uvCount) {
+    return UvJumped;
+  }
+  for (u32 k = 0; k < cur.uvCount; ++k) {
+    if (cur.uvOffset[k] != prev.uvOffset[k] || cur.uvType[k] != prev.uvType[k] || cur.uvFrac[k] != prev.uvFrac[k] ||
+        cur.uvComps[k] != prev.uvComps[k]) {
+      return UvJumped;
+    }
+  }
+  const u32 vtxCount = cur.key.vtxCount;
+  const u32 vtxSize = cur.key.vtxSize;
+  bool moved = false;
+  bool stepped = false;
+  for (u32 k = 0; k < cur.uvCount; ++k) {
+    for (u32 c = 0; c < cur.uvComps[k]; ++c) {
+      float lo = INFINITY;
+      float hi = -INFINITY;
+      float first = 0.f;
+      bool uniform = true;
+      float most = 0.f;
+      for (u32 v = 0; v < vtxCount; ++v) {
+        const float b = read_comp(uv_at(&sRaw[cur.raw + v * vtxSize], cur, k, c), cur.uvType[k], cur.uvFrac[k]);
+        const float a =
+            read_comp(uv_at(&sPrevRaw[prev.raw + v * vtxSize], cur, k, c), cur.uvType[k], cur.uvFrac[k]);
+        const float d = short_way(b - a);
+        lo = std::min(lo, b);
+        hi = std::max(hi, b);
+        if (v == 0) {
+          first = d;
+        } else if (std::abs(d - first) > 1e-3f) {
+          uniform = false;
+        }
+        most = std::max(most, std::abs(d));
+      }
+      if (most == 0.f) {
+        continue;
+      }
+      if (most > sTunables.texJump) {
+        return UvJumped;
+      }
+      const float extent = hi - lo;
+      if (uniform && extent > 1e-4f && std::abs(first) >= 0.5f * extent) {
+        stepped = true;
+      } else {
+        moved = true;
+      }
+    }
+  }
+  return stepped ? UvStepped : moved ? UvMoved : UvSame;
+}
+
 // What two draws must share to be paired: everything in the key but the texture
 // coordinates, which scroll on some meshes (the world map's vortex) from tick to tick.
 struct ShapeKey {
@@ -1170,17 +1301,43 @@ void match_draws(u32& matched, u32& rejected) noexcept {
   }
   u32 drawsMatched = 0;
   u32 drawsRigid = 0;
+  u32 uvCounts[5] = {};
+  u32 stepAdditive = 0;
   for (size_t i = 0; i < n; ++i) {
-    sDraws[i].match = pair[i];
+    auto& r = sDraws[i];
+    r.match = pair[i];
     drawsMatched += pair[i] >= 0;
     if (pair[i] >= 0) {
-      fit_rigid(sDraws[i], sPrevDraws[pair[i]]);
-      drawsRigid += sDraws[i].rigid;
+      fit_rigid(r, sPrevDraws[pair[i]]);
+      drawsRigid += r.rigid;
+      r.uvMode = uv_mode(r, sPrevDraws[pair[i]]);
+      ++uvCounts[r.uvMode];
+      stepAdditive += (r.uvMode == UvStepped || r.uvMode == UvSwapped) && r.additive;
     } else {
-      sDraws[i].rigid = false;
+      r.rigid = false;
+      r.uvMode = UvSame;
     }
   }
   sStats.drawsRigid = drawsRigid;
+  sStats.drawsUvMoved = uvCounts[UvMoved];
+  sStats.drawsUvStepped = uvCounts[UvStepped];
+  sStats.drawsTexSwapped = uvCounts[UvSwapped];
+  sStats.drawsStepAdditive = stepAdditive;
+  if (sTunables.debug != 0.f) {
+    u32 shown = 0;
+    for (size_t i = 0; i < n && shown < 12; ++i) {
+      const auto& r = sDraws[i];
+      if (r.match < 0 || r.uvMode == UvSame) {
+        continue;
+      }
+      const auto& p = sPrevDraws[r.match];
+      ++shown;
+      Log.info("  uv draw {} (prev {}): mode {} fmt {} prim {:#x} n {} uvs {} stages {} additive {} tex {} -> {} "
+               "centre {:.2f},{:.2f},{:.2f} r {:.3f} still {}",
+               i, r.match, r.uvMode, r.key.fmt, r.key.prim, r.key.vtxCount, r.uvCount, r.stages, r.additive, p.tex0,
+               r.tex0, r.centroid[0], r.centroid[1], r.centroid[2], r.radius, r.posHash == p.posHash);
+    }
+  }
   sStillPaired = stillPaired;
   sStats.draws = static_cast<u32>(n);
   sStats.drawsMatched = drawsMatched;
@@ -1271,6 +1428,47 @@ void match() noexcept {
         projMoved += d;
       }
     }
+    u32 texShown = 0;
+    for (size_t i = 0; i < sCurrent.size() && texShown < 10; ++i) {
+      const auto& r = sCurrent[i];
+      if (r.match < 0) {
+        continue;
+      }
+      const auto& p = sPrevious[r.match];
+      const auto texLog = [&](const char* kind, u32 k, const Mat3x4<float>& ma, const Mat3x4<float>& mb) {
+        if (std::memcmp(&ma, &mb, sizeof(ma)) == 0 || texShown >= 10) {
+          return;
+        }
+        float fa[12];
+        float fb[12];
+        std::memcpy(fa, &ma, sizeof(fa));
+        std::memcpy(fb, &mb, sizeof(fb));
+        float lin = 0.f;
+        for (int e : {0, 1, 2, 4, 5, 6}) {
+          lin = std::max(lin, std::abs(fb[e] - fa[e]));
+        }
+        ++texShown;
+        Log.info("  rec {} {} {}: translation {:.4f},{:.4f} -> {:.4f},{:.4f}; 2x3 part moved {:.4f} ({:.3f} {:.3f} / {:.3f} {:.3f})",
+                 i, kind, k, fa[3], fa[7], fb[3], fb[7], lin, fb[0], fb[1], fb[4], fb[5]);
+      };
+      for (u32 k = 0; k < MaxTexMtx; ++k) {
+        texLog("texmtx", k, p.look.texMtxs[k], r.look.texMtxs[k]);
+      }
+      for (u32 k = 0; k < MaxPTTexMtx; ++k) {
+        texLog("pttexmtx", k, p.look.ptTexMtxs[k], r.look.ptTexMtxs[k]);
+      }
+    }
+    u32 uvChanged = 0, clrChanged = 0, texChanged = 0;
+    for (const auto& r : sCurrent) {
+      if (r.match >= 0) {
+        const auto& p = sPrevious[r.match];
+        uvChanged += r.uvData != p.uvData;
+        clrChanged += r.clrData != p.clrData;
+        texChanged += r.textures != p.textures;
+      }
+    }
+    Log.info("  matched records whose indexed coordinates changed {}, indexed colours {}, textures {}", uvChanged,
+             clrChanged, texChanged);
     Log.info("match: {} records, {} previous, {} matched, {} rejected; matched translations moved {:.3f} in all, projections {:.4f}",
              sCurrent.size(), sPrevious.size(), matched, rejected, moved, projMoved);
     static u32 detailTicks = 0;
@@ -1312,6 +1510,7 @@ void match() noexcept {
   sStats.matched = matched - (sStats.drawsMatched - sStillPaired);
   sStats.rejected = rejected - sStats.drawsRejected;
   sStats.cut = sCut;
+  sStats.drawsUvUnpaired = sUvUnpaired;
   sStats.bytes = static_cast<u32>(sCapture.size());
 }
 
@@ -1408,13 +1607,174 @@ void fail(const char* why) noexcept {
 
 bool failed() noexcept { return sFailed; }
 
+namespace {
+// A component of an array element, in the array's byte order.
+float read_array_comp(const u8* p, u8 type, u8 frac, u8 size, bool le) noexcept {
+  u8 big[4];
+  for (u8 i = 0; i < size; ++i) {
+    big[i] = le ? p[size - 1 - i] : p[i];
+  }
+  return read_comp(big, type, frac);
+}
+
+void write_array_comp(u8* p, u8 type, u8 frac, u8 size, bool le, float value) noexcept {
+  u8 big[4];
+  write_comp(big, type, frac, value);
+  for (u8 i = 0; i < size; ++i) {
+    p[i] = le ? big[size - 1 - i] : big[i];
+  }
+}
+} // namespace
+
+const void* array_bytes(GXAttr attr, GXVtxFmt fmt, AttrArray& array, u32& size) noexcept {
+  array.replayType = 0xFF;
+  size = array.size;
+  if (attr < GX_VA_TEX0 || attr > GX_VA_TEX7 || array.data == nullptr || array.size == 0 ||
+      array.size > MaxArrayCopy) {
+    return array.data;
+  }
+  if (sRecording) {
+    if (!sArrays.contains(array.data)) {
+      sArrays.emplace(array.data, ArrayCopy{static_cast<u32>(sArrayBytes.size()), array.size});
+      const auto* bytes = static_cast<const u8*>(array.data);
+      sArrayBytes.insert(sArrayBytes.end(), bytes, bytes + array.size);
+    }
+    return array.data;
+  }
+  if (!sReplaying || sCut || sTunables.blend == 0.f || sTunables.uvs == 0.f || sBlend >= 1.f) {
+    return array.data;
+  }
+  const auto cur = sArrays.find(array.data);
+  const auto prev = sPrevArrays.find(array.data);
+  if (cur == sArrays.end() || prev == sPrevArrays.end() || cur->second.size != array.size ||
+      prev->second.size != array.size) {
+    return array.data;
+  }
+  const u8* b = &sArrayBytes[cur->second.offset];
+  const u8* a = &sPrevArrayBytes[prev->second.offset];
+  if (std::memcmp(a, b, array.size) == 0) {
+    return array.data;
+  }
+  const auto& attrFmt = g_gxState.vtxFmts[fmt].attrs[attr];
+  const u8 type = static_cast<u8>(attrFmt.type);
+  const u8 frac = attrFmt.frac;
+  const u32 comps = comp_cnt_count(attr, attrFmt.cnt);
+  const u8 compSize = comp_type_size(attr, attrFmt.type);
+  const u32 stride = array.stride;
+  if (stride == 0 || comps * compSize > stride || compSize > 4 || comps * 4 > 255) {
+    return array.data;
+  }
+  const u32 count = array.size / stride;
+  // A coordinate that moved further than texjump (a flipbook's cell, another layout) leaves
+  // the whole array as it is.
+  for (u32 e = 0; e < count; ++e) {
+    for (u32 c = 0; c < comps; ++c) {
+      const u32 at = e * stride + c * compSize;
+      const float d = read_array_comp(b + at, type, frac, compSize, array.le) - read_array_comp(a + at, type, frac, compSize, array.le);
+      if (std::abs(short_way(d)) > sTunables.texJump) {
+        return array.data;
+      }
+    }
+  }
+  if (sTunables.debug != 0.f) {
+    float most = 0.f;
+    for (u32 e = 0; e < count; ++e) {
+      for (u32 c = 0; c < comps; ++c) {
+        const u32 at = e * stride + c * compSize;
+        most = std::max(most, std::abs(short_way(read_array_comp(b + at, type, frac, compSize, array.le) -
+                                                 read_array_comp(a + at, type, frac, compSize, array.le))));
+      }
+    }
+    Log.info("  uv array {} attr {} type {} frac {} comps {} stride {} count {}: moved at most {:.5f} ({:.2f} steps)",
+             array.data, static_cast<int>(attr), type, frac, comps, stride, count, most, std::ldexp(most, frac));
+  }
+  const u32 outStride = comps * 4;
+  sArrayScratch.resize(static_cast<size_t>(count) * outStride);
+  for (u32 e = 0; e < count; ++e) {
+    for (u32 c = 0; c < comps; ++c) {
+      const u32 at = e * stride + c * compSize;
+      const float va = read_array_comp(a + at, type, frac, compSize, array.le);
+      const float vb = read_array_comp(b + at, type, frac, compSize, array.le);
+      const float value = va + short_way(vb - va) * sBlend;
+      std::memcpy(sArrayScratch.data() + e * outStride + c * 4, &value, 4);
+    }
+  }
+  array.replayType = GX_F32;
+  array.replayStride = static_cast<u8>(outStride);
+  size = count * outStride;
+  ++sStats.uvArraysBlended;
+  return sArrayScratch.data();
+}
+
+bool crossfade(Crossfade& out) noexcept {
+  if (!sCrossPending) {
+    return false;
+  }
+  sCrossPending = false;
+  out.previous = sCrossScratch.data();
+  out.weight = sCrossWeight;
+  out.textures = sCrossPrev != nullptr
+                     ? std::span<const PreviousTexture>(&sPrevDrawTextures[sCrossPrev->texFirst], sCrossPrev->texCount)
+                     : std::span<const PreviousTexture>{};
+  ++sStats.crossfaded;
+  return true;
+}
+
+void note_draw_textures() noexcept {
+  if (!sTexturesPending || sDraws.empty()) {
+    return;
+  }
+  sTexturesPending = false;
+  // The renderer's textures, which aurora's cache shares between equal contents: a texture
+  // the game rebuilds at another address each tick (text, the HUD) is the same one here.
+  auto& r = sDraws.back();
+  u64 tex = 0xCBF29CE484222325ull;
+  r.tex0 = nullptr;
+  for (u32 stage = 0; stage < g_gxState.numTevStages; ++stage) {
+    const u32 map = g_gxState.tevStages[stage].texMapId & 0xFF;
+    if (map < MaxTextures) {
+      const void* texture = g_gxState.textures[map].ref.get();
+      tex = fnv(tex, &texture, sizeof(texture));
+      if (r.tex0 == nullptr) {
+        r.tex0 = texture;
+      }
+    }
+  }
+  r.texHash = tex;
+  // An additive draw keeps its textures: a crossfade binds them again for its previous cell.
+  if (r.additive && sTunables.crossfade != 0.f) {
+    r.texFirst = static_cast<u32>(sDrawTextures.size());
+    for (u32 stage = 0; stage < g_gxState.numTevStages; ++stage) {
+      const u32 map = g_gxState.tevStages[stage].texMapId & 0xFF;
+      if (map >= MaxTextures) {
+        continue;
+      }
+      bool seen = false;
+      for (u32 k = r.texFirst; k < sDrawTextures.size(); ++k) {
+        seen |= sDrawTextures[k].map == map;
+      }
+      if (!seen) {
+        sDrawTextures.push_back({map, g_gxState.textures[map]});
+        ++r.texCount;
+      }
+    }
+  }
+}
+
+bool crossfade_enabled() noexcept { return sEnabled && sTunables.crossfade != 0.f; }
+
 const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* data) noexcept {
+  sCrossPending = false;
+  sTexturesPending = false;
   if (!sRecording && !sReplaying) {
     return data;
   }
   DrawRecord probe;
   u32 uvOffset;
   if (vtxCount == 0 || vtxSize == 0 || !position_layout(fmt, probe, uvOffset)) {
+    if (sRecording && probe.uvCount != 0) {
+      ++sUvUnpaired;
+    }
     return data;
   }
   const u32 index = sDrawIndex++;
@@ -1452,9 +1812,12 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
       r2 += 0.25f * (hi[c] - lo[c]) * (hi[c] - lo[c]);
     }
     probe.radius = std::sqrt(r2);
+    probe.stages = static_cast<u8>(g_gxState.numTevStages);
+    probe.additive = g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacDst == GX_BL_ONE;
     probe.raw = static_cast<u32>(sRaw.size());
     sRaw.insert(sRaw.end(), data, data + static_cast<size_t>(vtxCount) * vtxSize);
     sDraws.push_back(probe);
+    sTexturesPending = true;
     return data;
   }
   // Replay: the same stream from the same state, so the same draw at the same index. At
@@ -1533,6 +1896,39 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
     }
     sStats.colorsBlended += changed;
   }
+  // Texture coordinates that moved a little (a scroll), the short way round a wrap.
+  if (sTunables.uvs != 0.f && cur.uvMode == UvMoved) {
+    for (u32 k = 0; k < cur.uvCount; ++k) {
+      const u8 type = cur.uvType[k];
+      const u8 frac = cur.uvFrac[k];
+      for (u32 v = 0; v < vtxCount; ++v) {
+        for (u32 c = 0; c < cur.uvComps[k]; ++c) {
+          const float a = read_comp(uv_at(&sPrevRaw[prev.raw + v * vtxSize], cur, k, c), type, frac);
+          const float b = read_comp(uv_at(data + v * vtxSize, cur, k, c), type, frac);
+          write_comp(const_cast<u8*>(uv_at(sVertexScratch.data() + v * vtxSize, cur, k, c)), type, frac,
+                     a + short_way(b - a) * t);
+        }
+      }
+    }
+    ++sStats.uvsBlended;
+  }
+  // An additive flipbook that stepped a cell: drawn twice, the previous tick's cell fading
+  // out as this one fades in (its positions and colours are this picture's either way).
+  const bool swapped = cur.uvMode == UvSwapped && cur.texCount != 0 && cur.texCount == prev.texCount;
+  if (sTunables.crossfade != 0.f && (cur.uvMode == UvStepped || swapped) && cur.additive && prev.additive &&
+      t > 0.f) {
+    sCrossScratch = sVertexScratch;
+    for (u32 k = 0; k < cur.uvCount; ++k) {
+      const u8 size = cur.uvType[k] == GX_F32 ? 4 : cur.uvType[k] >= GX_U16 ? 2 : 1;
+      for (u32 v = 0; v < vtxCount; ++v) {
+        std::memcpy(sCrossScratch.data() + v * vtxSize + cur.uvOffset[k],
+                    &sPrevRaw[prev.raw + v * vtxSize + cur.uvOffset[k]], static_cast<size_t>(size) * cur.uvComps[k]);
+      }
+    }
+    sCrossPending = true;
+    sCrossWeight = t;
+    sCrossPrev = swapped ? &prev : nullptr;
+  }
   ++sStats.drawsBlended;
   return sVertexScratch.data();
 }
@@ -1545,6 +1941,26 @@ void before_uniform(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount) noexcept {
       Record r{.key = key};
       save_matrices(r.m);
       save_look(r.look);
+      if (sTunables.debug != 0.f) {
+        const auto array_hash = [](GXAttr attr) {
+          const auto& a = g_gxState.arrays[attr];
+          const auto desc = g_gxState.vtxDesc[attr];
+          if ((desc != GX_INDEX8 && desc != GX_INDEX16) || a.data == nullptr) {
+            return u64{0};
+          }
+          return fnv(0xCBF29CE484222325ull, a.data, std::min<size_t>(a.size, 65536));
+        };
+        r.uvData = array_hash(GX_VA_TEX0) ^ array_hash(GX_VA_TEX1) * 31;
+        r.clrData = array_hash(GX_VA_CLR0);
+        u64 tex = 0xCBF29CE484222325ull;
+        for (u32 stage = 0; stage < g_gxState.numTevStages; ++stage) {
+          const u32 map = g_gxState.tevStages[stage].texMapId & 0xFF;
+          if (map < MaxTextures) {
+            tex = fnv(tex, &g_gxState.loadedTextures[map].data, sizeof(void*));
+          }
+        }
+        r.textures = tex;
+      }
       sCurrentByHash.emplace(hash, static_cast<u32>(sCurrent.size()));
       sCurrent.push_back(r);
     }
@@ -1637,6 +2053,12 @@ void aurora_replay_enable(bool enabled) {
     sPrevPositions = {};
     sRaw = {};
     sPrevRaw = {};
+    sDrawTextures = {};
+    sPrevDrawTextures = {};
+    sArrays = {};
+    sPrevArrays = {};
+    sArrayBytes = {};
+    sPrevArrayBytes = {};
     sTurns = {};
     sReads = {};
     sReadSet = {};
@@ -1659,7 +2081,14 @@ void aurora_replay_begin_tick() {
   sPositions.clear();
   sPrevRaw = std::move(sRaw);
   sRaw.clear();
+  sPrevDrawTextures = std::move(sDrawTextures);
+  sDrawTextures.clear();
+  sPrevArrays = std::move(sArrays);
+  sArrays.clear();
+  sPrevArrayBytes = std::move(sArrayBytes);
+  sArrayBytes.clear();
   sDrawIndex = 0;
+  sUvUnpaired = 0;
   sCurrentByHash.clear();
   sCapture.clear();
   sReads.clear();
@@ -1771,6 +2200,10 @@ bool aurora_replay_set_tunable(const char* name, float value) {
     sTunables.colorMax = value;
   } else if (n == "texjump") {
     sTunables.texJump = value;
+  } else if (n == "uvs") {
+    sTunables.uvs = value;
+  } else if (n == "crossfade") {
+    sTunables.crossfade = value;
   } else if (n == "debug") {
     sTunables.debug = value;
   } else if (n == "blend") {

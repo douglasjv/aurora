@@ -1768,6 +1768,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
 
+  if (config.fade) {
+    // Replay crossfade (an additive flipbook drawn twice, its cells cross-faded)
+    fragmentFn += "\n    prev = vec4f(prev.rgb * (1.0 - bitcast<f32>(imm.fade)), prev.a);";
+  }
+
   if (dstAlphaMode == DstAlphaMode::Replace) {
     // GX destination alpha is set via the blend constant
     fragmentFn += "\n    prev.a = 1.0;";
@@ -2143,7 +2148,7 @@ struct Immediate {{
     vtx_start: u32,
     current_pnmtx: u32,
     fog_range_base: u32,
-    _pad: u32,
+    fade: u32,
     array_start0: vec4u,
     array_start1: vec4u,
     array_start2: vec4u,

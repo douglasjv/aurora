@@ -75,6 +75,25 @@ typedef struct {
   uint32_t looksBlended;
   // Position draws whose vertex colours were blended (the screen fade), all replays so far.
   uint32_t colorsBlended;
+  // Of the paired position draws of the last closed tick, by how their texture coordinates in
+  // the stream changed: moved a little (a scroll, blended), stepped by a cell or more (a
+  // flipbook, not blended), or drew another texture (a flipbook of textures); and of the
+  // stepped or swapped ones, those drawn additively (a glow, a flame).
+  uint32_t drawsUvMoved;
+  uint32_t drawsUvStepped;
+  uint32_t drawsTexSwapped;
+  uint32_t drawsStepAdditive;
+  // Draws of the last closed tick with texture coordinates in the stream but indexed
+  // positions: not paired, so their coordinates are never blended.
+  uint32_t drawsUvUnpaired;
+  // Position draws whose texture coordinates were blended, all replays so far.
+  uint32_t uvsBlended;
+  // Indexed texture coordinate arrays the game rewrote between ticks (Noxus's vortex) and
+  // that were blended, all replays so far.
+  uint32_t uvArraysBlended;
+  // Flipbook draws drawn twice, the previous tick's cell and this one's cross-faded
+  // (crossfade=1), all replays so far.
+  uint32_t crossfaded;
 } AuroraReplayStats;
 
 void aurora_replay_enable(bool enabled);
@@ -96,7 +115,9 @@ void aurora_replay_skip_tick();
 // maxturn, jumprel, jumpabs, cutmin, cutfraction, nearestmax, blend (0 draws replays unblended),
 // vertices (0 leaves positions in the stream unblended), rotation (0 blends matrices element by
 // element), rigid (the residual a turning draw may have, 0 never turns), rigidmin (degrees),
-// colors (0 leaves colours, fog and texture matrices unblended), colormax, texjump, debug.
+// colors (0 leaves colours, fog and texture matrices unblended), colormax, texjump (also for
+// texture coordinates in the stream), uvs (0 leaves texture coordinates in the stream
+// unblended), crossfade (1 cross-fades additive flipbooks; off by default), debug.
 bool aurora_replay_set_tunable(const char* name, float value);
 const AuroraReplayStats* aurora_replay_stats();
 

@@ -387,12 +387,21 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
   return vtxSize;
 }
 
+// The fade of the draw being pushed (DrawImmediateData::fade): set only around a replay's
+// cross-faded flipbook draws.
+static u32 sDrawFade = 0;
+// The cached pipeline reads a replay's blended arrays as floats (AttrArray::replayType).
+static bool sPipelineFloatArrays = false;
+// Textures a replay's cross-faded draw binds instead of the state's (its previous cell's).
+static std::span<const replay::PreviousTexture> sTextureOverride;
+
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices) noexcept {
   auto& state = g_gxState;
   auto& cache = sDrawCache;
 
-  DrawImmediateData immediates{.vtxStart = vertRange.offset, .currentPnMtx = state.currentPnMtx};
+  DrawImmediateData immediates{.vtxStart = vertRange.offset, .currentPnMtx = state.currentPnMtx, .fade = sDrawFade};
+  bool floatArrays = false;
   for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
     if (state.vtxDesc[i] != GX_INDEX8 && state.vtxDesc[i] != GX_INDEX16) {
       continue;
@@ -400,9 +409,17 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     auto& array = state.arrays[i];
     replay::note_read(array.data, array.size);
     if (array.cachedRange.size == 0) {
-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+      u32 size = array.size;
+      const void* bytes = replay::array_bytes(static_cast<GXAttr>(i), fmt, array, size);
+      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(bytes), size);
     }
+    floatArrays |= array.replayType != 0xFF;
     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
+  }
+  // A replay's blended arrays read as floats need their own pipeline, and so does the next
+  // draw after one.
+  if (floatArrays || sPipelineFloatArrays) {
+    state.dirty |= DirtyPipeline;
   }
 
   const u8 lineMode = line_mode_for_prim(prim);
@@ -414,6 +431,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
     populate_pipeline_config(cache.config, prim, fmt);
+    sPipelineFloatArrays = floatArrays;
     cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
     cache.pipelineRef = gfx::pipeline_ref(cache.config);
     cache.targetLayoutKey = targetLayoutKey;
@@ -432,6 +450,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   if (!bindGroupsValid) {
     const auto prevBindGroup = cache.bindGroups.textureBindGroup;
     resolve_sampled_textures(cache.shaderInfo);
+    for (const auto& t : sTextureOverride) {
+      g_gxState.textures[t.map] = t.bind;
+    }
     cache.bindGroups = build_bind_groups(cache.shaderInfo);
     cache.bindGeneration = texture::current_bind_generation();
     state.dirty &= ~DirtyTextures;
@@ -521,13 +542,43 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
                           prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
   auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
-  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1;
 
   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
   if (trace_2d::enabled() && !replay::replaying())
     UNLIKELY { trace_2d::draw(prim, fmt, vtxCount, vtxSize, vertexData.data()); }
   const u8* vertices = replay::vertices(prim, fmt, vtxCount, vtxSize, vertexData.data());
+  replay::Crossfade fade;
+  if (replay::crossfade(fade))
+    UNLIKELY {
+      // A replay's cross-faded flipbook: this tick's cell scaled by weight, the previous
+      // tick's by 1 - weight (with its own textures, when it swapped them), each a draw of
+      // its own (a draw's fade is per draw).
+      gfx::Range vertRange = gfx::push_verts(vertices, vertexData.size(), 4);
+      sDrawFade = std::bit_cast<u32>(1.f - fade.weight);
+      handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
+      vertRange = gfx::push_verts(fade.previous, vertexData.size(), 4);
+      sDrawFade = std::bit_cast<u32>(fade.weight);
+      std::array<gfx::TextureBind, MaxTextures> saved;
+      if (!fade.textures.empty()) {
+        for (const auto& t : fade.textures) {
+          saved[t.map] = g_gxState.textures[t.map];
+        }
+        sTextureOverride = fade.textures;
+        g_gxState.dirty |= DirtyTextures;
+      }
+      handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
+      if (!fade.textures.empty()) {
+        for (const auto& t : fade.textures) {
+          g_gxState.textures[t.map] = saved[t.map];
+        }
+        sTextureOverride = {};
+        g_gxState.dirty |= DirtyTextures;
+      }
+      sDrawFade = 0;
+      return;
+    }
+  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1 && lastDraw->immediateData.fade == 0;
   gfx::Range vertRange = gfx::push_verts(vertices, vertexData.size(), canMerge ? 0 : 4);
 
   // Try to merge with previous draw call
@@ -562,10 +613,12 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     lastDraw->vtxCount += vtxCount;
     lastDraw->indexCount += numIndices;
     gfx::detail::increment_merged_draw_count();
+    replay::note_draw_textures();
     return;
   }
 
   handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
+  replay::note_draw_textures();
 }
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
@@ -794,6 +847,7 @@ void handle_aurora(ByteReader& reader) noexcept {
     if (indexCount != 0) {
       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
     }
+    replay::note_draw_textures();
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
     auto label = reader.read_string();
     gfx::push_debug_group(std::move(label));

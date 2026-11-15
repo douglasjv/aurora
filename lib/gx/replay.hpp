@@ -10,8 +10,15 @@
 // snapshots, evictions). Off by default; when off, none of this runs.
 
 #include "../internal.hpp"
+#include "../gfx/texture.hpp"
+
+#include <span>
 
 #include <dolphin/gx/GXEnum.h>
+
+namespace aurora::gx {
+struct AttrArray;
+}
 
 namespace aurora::gx::replay {
 
@@ -35,6 +42,36 @@ void note_read(const void* data, size_t size) noexcept;
 // bytes with those positions blended toward the previous tick's matching draw (in a buffer
 // valid until the next call), or `data` itself.
 const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* data) noexcept;
+
+// A texture the previous tick's draw sampled, by texture map.
+struct PreviousTexture {
+  u32 map;
+  gfx::TextureBind bind;
+};
+struct Crossfade {
+  const u8* previous = nullptr; // the vertices with the previous tick's texture coordinates
+  float weight = 1.f;           // this tick's share
+  std::span<const PreviousTexture> textures; // to bind for the previous cell (a swapped texture)
+};
+// After vertices(), on a replay with crossfade=1: true when that draw is an additive
+// flipbook that stepped a cell or swapped its texture since the previous tick. It is then
+// drawn twice: with the bytes vertices() returned, its colour scaled by `weight`, and with
+// `previous` and the previous tick's textures, scaled by 1 - weight. Valid until the next
+// vertices().
+bool crossfade(Crossfade& out) noexcept;
+// After a draw is pushed (its textures resolved): on the first decode, notes which textures
+// the draw vertices() last recorded samples.
+void note_draw_textures() noexcept;
+// Whether crossfade=1: additive draws then get shaders that can scale their colour.
+bool crossfade_enabled() noexcept;
+
+// A vertex attribute array's bytes for the GPU: on the first decode, keeps a copy of a
+// texture coordinate array; on a replay, returns the array blended from the previous tick's
+// copy when the game rewrote it (a scroll, taken the short way round a wrap), as floats
+// (the game's fixed point moves a whole step a tick: a blend between rounds to one end),
+// setting the array's replayType and replayStride and `size` to the bytes to push, in a
+// buffer valid until the next call; or the array's own bytes.
+const void* array_bytes(GXAttr attr, GXVtxFmt fmt, AttrArray& array, u32& size) noexcept;
 
 // Around build_uniform: records the draw's matrices (first decode) or swaps in the
 // blended ones (replay). after_uniform puts the state's matrices back.
