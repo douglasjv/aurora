@@ -103,6 +103,14 @@ void aurora_replay_begin_tick();
 void aurora_replay_close_tick();
 void aurora_end_frame_hidden();
 bool aurora_replay_draw(float blend);
+// aurora_replay_draw with the motion and the looks placed apart. motion places matrices,
+// positions in the stream, texture coordinates and texture matrices: 0 the previous tick, 1
+// this one, and above 1 (up to 2) ahead of it, carried on at the rate they moved between the
+// two ticks (extrapolated). looks places colours, fog, vertex colours and a crossfade's
+// weight, 0 to 1 only: a fade is never shown ahead of the tick. Draws that are not paired, a
+// pair that moved too far and a cut tick are shown as the tick has them, as by
+// aurora_replay_draw. aurora_replay_draw(b) is aurora_replay_draw_at(b, b).
+bool aurora_replay_draw_at(float motion, float looks);
 void aurora_replay_end_tick();
 // Whether the last closed tick's first decode read game memory overlapping [data, data +
 // size) (vertex arrays, indexed matrix loads, textures, TLUTs), so its replays would read

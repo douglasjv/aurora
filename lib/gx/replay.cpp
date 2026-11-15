@@ -199,7 +199,12 @@ bool sReady = false; // a closed tick waits to be replayed
 bool sSkip = false;  // the kept tick drew outside the stream (aurora_replay_skip_tick)
 bool sCut = false;
 bool sSwapped = false;
-float sBlend = 1.f;
+// Where a replay shows the tick (aurora_replay_draw_at): motion (matrices, positions, texture
+// coordinates and texture matrices) from the previous tick (0) to this one (1) and on ahead
+// of it (above 1, up to 2: extrapolated); looks (colours, fog, vertex colours, a crossfade's
+// weight) from 0 to 1. Both 1: the tick as it is.
+float sMotion = 1.f;
+float sLooks = 1.f;
 Tunables sTunables;
 AuroraReplayStats sStats{};
 
@@ -1666,7 +1671,7 @@ const void* array_bytes(GXAttr attr, GXVtxFmt fmt, AttrArray& array, u32& size) 
     }
     return array.data;
   }
-  if (!sReplaying || sCut || sTunables.blend == 0.f || sTunables.uvs == 0.f || sBlend >= 1.f) {
+  if (!sReplaying || sCut || sTunables.blend == 0.f || sTunables.uvs == 0.f || sMotion == 1.f) {
     return array.data;
   }
   const auto cur = sArrays.find(array.data);
@@ -1720,7 +1725,7 @@ const void* array_bytes(GXAttr attr, GXVtxFmt fmt, AttrArray& array, u32& size) 
       const u32 at = e * stride + c * compSize;
       const float va = read_array_comp(a + at, type, frac, compSize, array.le);
       const float vb = read_array_comp(b + at, type, frac, compSize, array.le);
-      const float value = va + short_way(vb - va) * sBlend;
+      const float value = va + short_way(vb - va) * sMotion;
       std::memcpy(sArrayScratch.data() + e * outStride + c * 4, &value, 4);
     }
   }
@@ -1846,8 +1851,10 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
     return data;
   }
   // Replay: the same stream from the same state, so the same draw at the same index. At
-  // blend 1 the draw is the tick's own (exactly: a blend there would add rounding).
-  if (sCut || sTunables.blend == 0.f || sTunables.vertices == 0.f || sBlend >= 1.f || index >= sDraws.size()) {
+  // motion and looks 1 the draw is the tick's own (exactly: a blend there would add
+  // rounding), and so is whichever of the two is at 1.
+  if (sCut || sTunables.blend == 0.f || sTunables.vertices == 0.f || (sMotion == 1.f && sLooks == 1.f) ||
+      index >= sDraws.size()) {
     return data;
   }
   const DrawRecord& cur = sDraws[index];
@@ -1857,12 +1864,15 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
   }
   const DrawRecord& prev = sPrevDraws[cur.match];
   sVertexScratch.assign(data, data + static_cast<size_t>(vtxCount) * vtxSize);
-  const float t = sBlend;
+  const float t = sMotion;
   const u8 size = cur.posType == GX_F32 ? 4 : cur.posType >= GX_U16 ? 2 : 1;
-  if (cur.rigid) {
+  if (t == 1.f) {
+    // Positions where the tick has them (only the looks are blended).
+  } else if (cur.rigid) {
     // Along the screw: each position turns by t of the angle about the axis through the
     // pivot and slides t of the way along it; what the rigid turn leaves unexplained (the
-    // residual) is added in proportion, so t = 0 and t = 1 give the two ticks exactly.
+    // residual) is added in proportion, so t = 0 and t = 1 give the two ticks exactly, and
+    // above 1 the turn carries on along the same arc.
     const M3 full = axis_angle(cur.axis, cur.angle);
     const M3 part = axis_angle(cur.axis, cur.angle * t);
     for (u32 v = 0; v < vtxCount; ++v) {
@@ -1891,7 +1901,8 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
     }
   }
   // Vertex colours (the screen fade's quad), unless a channel jumps (a switch, not a fade).
-  if (sTunables.colors != 0.f && cur.clrCount != 0 && prev.clrCount == cur.clrCount) {
+  // They follow the looks: a fade is never extrapolated.
+  if (sTunables.colors != 0.f && sLooks != 1.f && cur.clrCount != 0 && prev.clrCount == cur.clrCount) {
     bool blendable = true;
     for (u32 k = 0; k < cur.clrCount && blendable; ++k) {
       blendable = prev.clrType[k] == cur.clrType[k] && prev.clrOffset[k] == cur.clrOffset[k];
@@ -1913,7 +1924,7 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
         read_color(&sPrevRaw[prev.raw + v * vtxSize + cur.clrOffset[k]], cur.clrType[k], ca, max);
         read_color(data + v * vtxSize + cur.clrOffset[k], cur.clrType[k], cb, max);
         for (int c = 0; c < 4; ++c) {
-          out[c] = static_cast<int>(std::lround(ca[c] + (cb[c] - ca[c]) * t));
+          out[c] = static_cast<int>(std::lround(ca[c] + (cb[c] - ca[c]) * sLooks));
           changed |= ca[c] != cb[c];
         }
         write_color(sVertexScratch.data() + v * vtxSize + cur.clrOffset[k], cur.clrType[k], out);
@@ -1921,8 +1932,9 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
     }
     sStats.colorsBlended += changed;
   }
-  // Texture coordinates that moved a little (a scroll), the short way round a wrap.
-  if (sTunables.uvs != 0.f && cur.uvMode == UvMoved) {
+  // Texture coordinates that moved a little (a scroll), the short way round a wrap. A scroll
+  // is motion: ahead of the tick it carries on.
+  if (sTunables.uvs != 0.f && t != 1.f && cur.uvMode == UvMoved) {
     for (u32 k = 0; k < cur.uvCount; ++k) {
       const u8 type = cur.uvType[k];
       const u8 frac = cur.uvFrac[k];
@@ -1941,7 +1953,7 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
   // out as this one fades in (its positions and colours are this picture's either way).
   const bool swapped = cur.uvMode == UvSwapped && cur.texCount != 0 && cur.texCount == prev.texCount;
   if (sTunables.crossfade != 0.f && (cur.uvMode == UvStepped || swapped) && cur.additive && prev.additive &&
-      t > 0.f) {
+      sLooks > 0.f && sLooks < 1.f) {
     sCrossScratch = sVertexScratch;
     for (u32 k = 0; k < cur.uvCount; ++k) {
       const u8 size = cur.uvType[k] == GX_F32 ? 4 : cur.uvType[k] >= GX_U16 ? 2 : 1;
@@ -1951,7 +1963,7 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
       }
     }
     sCrossPending = true;
-    sCrossWeight = t;
+    sCrossWeight = sLooks;
     sCrossPrev = swapped ? &prev : nullptr;
   }
   ++sStats.drawsBlended;
@@ -1991,7 +2003,7 @@ void before_uniform(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount) noexcept {
     }
     return;
   }
-  if (!sReplaying || sCut || sTunables.blend == 0.f || sBlend >= 1.f) {
+  if (!sReplaying || sCut || sTunables.blend == 0.f || (sMotion == 1.f && sLooks == 1.f)) {
     return;
   }
   const Key key = current_key(prim, fmt, vtxCount);
@@ -2007,39 +2019,49 @@ void before_uniform(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount) noexcept {
   const Record& prev = sPrevious[cur.match];
   save_matrices(sSaved);
   save_look(sSavedLook);
-  // Blend from where the draw was a tick ago (t = 0) to where it is now (t = 1).
-  const float t = sBlend;
+  // Blend from where the draw was a tick ago (t = 0) to where it is now (t = 1), or carry
+  // on ahead of it (t above 1). At 1 the state already holds the tick's own matrices.
+  const float t = sMotion;
+  const float lt = sLooks;
   auto& state = g_gxState;
   const auto& turns = sTurns[it->second];
-  for (u32 i = 0; i < MaxPnMtx; ++i) {
-    state.pnMtx[i].pos = blend_matrix(prev.m.pos[i], cur.m.pos[i], turns[i], t);
-    state.pnMtx[i].nrm = blend_matrix(prev.m.nrm[i], cur.m.nrm[i], turns[MaxPnMtx + i], t);
+  if (t != 1.f) {
+    for (u32 i = 0; i < MaxPnMtx; ++i) {
+      state.pnMtx[i].pos = blend_matrix(prev.m.pos[i], cur.m.pos[i], turns[i], t);
+      state.pnMtx[i].nrm = blend_matrix(prev.m.nrm[i], cur.m.nrm[i], turns[MaxPnMtx + i], t);
+    }
+    state.proj = lerp(prev.m.proj, cur.m.proj, t);
   }
-  state.proj = lerp(prev.m.proj, cur.m.proj, t);
   if (sTunables.colors != 0.f) {
     const Look& a = prev.look;
     const Look& b = cur.look;
-    for (u32 i = 0; i < MaxTevRegs; ++i) {
-      state.colorRegs[i] = blend_color(a.colorRegs[i], b.colorRegs[i], t);
+    // Colours and fog follow the looks (never ahead of the tick: a fade that overshoots is
+    // worse than one that is late); texture matrices (scrolls) follow the motion.
+    if (lt != 1.f) {
+      for (u32 i = 0; i < MaxTevRegs; ++i) {
+        state.colorRegs[i] = blend_color(a.colorRegs[i], b.colorRegs[i], lt);
+      }
+      for (u32 i = 0; i < GX_MAX_KCOLOR; ++i) {
+        state.kcolors[i] = blend_color(a.kcolors[i], b.kcolors[i], lt);
+      }
+      for (u32 i = 0; i < MaxColorChannels; ++i) {
+        state.colorChannelState[i].matColor = blend_color(a.mat[i], b.mat[i], lt);
+        state.colorChannelState[i].ambColor = blend_color(a.amb[i], b.amb[i], lt);
+      }
+      if (a.fogType == b.fogType) {
+        state.fog.color = blend_color(a.fogColor, b.fogColor, lt);
+        state.fog.a = a.fogA + (b.fogA - a.fogA) * lt;
+        state.fog.b = a.fogB + (b.fogB - a.fogB) * lt;
+        state.fog.c = a.fogC + (b.fogC - a.fogC) * lt;
+      }
     }
-    for (u32 i = 0; i < GX_MAX_KCOLOR; ++i) {
-      state.kcolors[i] = blend_color(a.kcolors[i], b.kcolors[i], t);
-    }
-    for (u32 i = 0; i < MaxColorChannels; ++i) {
-      state.colorChannelState[i].matColor = blend_color(a.mat[i], b.mat[i], t);
-      state.colorChannelState[i].ambColor = blend_color(a.amb[i], b.amb[i], t);
-    }
-    if (a.fogType == b.fogType) {
-      state.fog.color = blend_color(a.fogColor, b.fogColor, t);
-      state.fog.a = a.fogA + (b.fogA - a.fogA) * t;
-      state.fog.b = a.fogB + (b.fogB - a.fogB) * t;
-      state.fog.c = a.fogC + (b.fogC - a.fogC) * t;
-    }
-    for (u32 i = 0; i < MaxTexMtx; ++i) {
-      state.texMtxs[i] = blend_tex_mtx(a.texMtxs[i], b.texMtxs[i], t);
-    }
-    for (u32 i = 0; i < MaxPTTexMtx; ++i) {
-      state.ptTexMtxs[i] = blend_tex_mtx(a.ptTexMtxs[i], b.ptTexMtxs[i], t);
+    if (t != 1.f) {
+      for (u32 i = 0; i < MaxTexMtx; ++i) {
+        state.texMtxs[i] = blend_tex_mtx(a.texMtxs[i], b.texMtxs[i], t);
+      }
+      for (u32 i = 0; i < MaxPTTexMtx; ++i) {
+        state.ptTexMtxs[i] = blend_tex_mtx(a.ptTexMtxs[i], b.ptTexMtxs[i], t);
+      }
     }
     if (look_distance(a, b) != 0.f || color_distance(a.fogColor, b.fogColor) != 0.f ||
         std::memcmp(a.texMtxs.data(), b.texMtxs.data(), sizeof(a.texMtxs)) != 0 ||
@@ -2150,7 +2172,9 @@ void aurora_end_frame_hidden() {
   sReady = true;
 }
 
-bool aurora_replay_draw(float blend) {
+bool aurora_replay_draw(float blend) { return aurora_replay_draw_at(blend, blend); }
+
+bool aurora_replay_draw_at(float motion, float looks) {
   if (!sReady || sSkip) {
     return false;
   }
@@ -2166,7 +2190,8 @@ bool aurora_replay_draw(float blend) {
   g_gxState = *sStart;
   fifo::restore_draw_cache(0);
   sFailed = false;
-  sBlend = std::clamp(blend, 0.f, 1.f);
+  sMotion = std::clamp(motion, 0.f, 2.f);
+  sLooks = std::clamp(looks, 0.f, 1.f);
   sDrawIndex = 0;
   sReplaying = true;
   decode(sCapture);
