@@ -66,6 +66,7 @@ typedef struct {
   uint32_t drawsMatched;  // of those, paired with one from the tick before
   uint32_t drawsRejected; // paired, but moved too far to blend
   uint32_t drawsBlended;  // draws whose positions were blended, all replays so far
+  uint32_t ticksSkipped;  // ticks not replayed because something drew outside the stream, so far
 } AuroraReplayStats;
 
 void aurora_replay_enable(bool enabled);
@@ -78,6 +79,12 @@ void aurora_replay_end_tick();
 // size) (vertex arrays, indexed matrix loads, textures, TLUTs), so its replays would read
 // it again: a block the game freed during the tick matters only if this is true.
 bool aurora_replay_reads(const void* data, size_t size);
+// Something drew into the tick being kept by calling the renderer directly (aurora::gfx::
+// create_pass, resolve_pass, push_custom_draw: the port's padded texture copy) rather than
+// through the GX stream. A replay decodes only the stream, so it would miss that drawing
+// and could rebuild a copied texture without it: the tick is not replayed, and is shown as
+// it is.
+void aurora_replay_skip_tick();
 // maxturn, jumprel, jumpabs, cutmin, cutfraction, nearestmax, blend (0 draws replays unblended),
 // vertices (0 leaves positions in the stream unblended), debug.
 bool aurora_replay_set_tunable(const char* name, float value);
