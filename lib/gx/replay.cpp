@@ -5,11 +5,13 @@
 #include "command_processor.hpp"
 #include "fifo.hpp"
 #include "gx.hpp"
+#include "texture.hpp"
 
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 
 #include <algorithm>
 #include <array>
@@ -92,6 +94,10 @@ std::vector<Record> sPrevious;
 // The first decode's records by the hash of their key and matrices: a replay recomputes
 // the hash from the same state and finds its record without relying on build order.
 absl::flat_hash_map<u64, u32> sCurrentByHash;
+// Game memory the tick's first decode read, as [begin, end) ranges: noted while
+// recording (deduplicated), sorted and merged when the tick closes.
+std::vector<std::pair<uintptr_t, uintptr_t>> sReads;
+absl::flat_hash_set<std::pair<uintptr_t, uintptr_t>> sReadSet;
 std::unique_ptr<GXState> sStart;
 std::unique_ptr<GXState> sEnd;
 Matrices sSaved;
@@ -164,7 +170,7 @@ M lerp(const M& a, const M& b, float t) noexcept {
     fa[i] += (fb[i] - fa[i]) * t;
   }
   M out;
-  std::memcpy(&out, fa, sizeof(M));
+  std::memcpy(static_cast<void*>(&out), fa, sizeof(M));
   return out;
 }
 
@@ -286,6 +292,46 @@ std::unique_ptr<GXState> snapshot() {
   return copy;
 }
 
+void note_texture(const GXTexObj_& obj) noexcept {
+  if (obj.has_data()) {
+    note_read(obj.data, texture::texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count()));
+  }
+}
+
+void note_tlut(const GXTlutObj_& tlut) noexcept {
+  if (reinterpret_cast<uintptr_t>(tlut.data) >= 0x10000) {
+    note_read(tlut.data, texture::tlut_source_size(tlut.numEntries));
+  }
+}
+
+// What the tick can read without loading it first: the arrays, textures and TLUTs in
+// the state it starts from.
+void note_start_state() noexcept {
+  for (const auto& array : g_gxState.arrays) {
+    note_read(array.data, array.size);
+  }
+  for (const auto& obj : g_gxState.loadedTextures) {
+    note_texture(obj);
+  }
+  for (const auto& tlut : g_gxState.loadedTluts) {
+    note_tlut(tlut);
+  }
+}
+
+void merge_reads() noexcept {
+  std::sort(sReads.begin(), sReads.end());
+  size_t out = 0;
+  for (const auto& range : sReads) {
+    if (out != 0 && range.first <= sReads[out - 1].second) {
+      sReads[out - 1].second = std::max(sReads[out - 1].second, range.second);
+    } else {
+      sReads[out++] = range;
+    }
+  }
+  sReads.resize(out);
+  sReadSet.clear();
+}
+
 void decode(const std::vector<u8>& bytes) noexcept {
   size_t offset = 0;
   while (offset < bytes.size() && !sFailed) {
@@ -308,6 +354,17 @@ void append(const u8* data, u32 size) noexcept {
 }
 
 bool replaying() noexcept { return sReplaying; }
+
+void note_read(const void* data, size_t size) noexcept {
+  if (!sRecording || data == nullptr || size == 0) {
+    return;
+  }
+  const auto begin = reinterpret_cast<uintptr_t>(data);
+  const std::pair<uintptr_t, uintptr_t> range{begin, begin + size};
+  if (sReadSet.insert(range).second) {
+    sReads.push_back(range);
+  }
+}
 
 void fail(const char* why) noexcept {
   if (!sFailed) {
@@ -377,6 +434,8 @@ void aurora_replay_enable(bool enabled) {
     sCurrent = {};
     sPrevious = {};
     sCurrentByHash = {};
+    sReads = {};
+    sReadSet = {};
     sStart.reset();
     sEnd.reset();
   }
@@ -391,10 +450,13 @@ void aurora_replay_begin_tick() {
   sCurrent.clear();
   sCurrentByHash.clear();
   sCapture.clear();
+  sReads.clear();
+  sReadSet.clear();
   sStart = snapshot();
   fifo::save_draw_cache(0);
   sCapturing = true;
   sRecording = true;
+  note_start_state();
 }
 
 void aurora_replay_close_tick() {
@@ -404,6 +466,7 @@ void aurora_replay_close_tick() {
   fifo::drain();
   sCapturing = false;
   sRecording = false;
+  merge_reads();
 }
 
 void aurora_end_frame_hidden() {
@@ -449,6 +512,15 @@ void aurora_replay_end_tick() {
   g_gxState = *sEnd;
   fifo::restore_draw_cache(1);
   sReady = false;
+}
+
+bool aurora_replay_reads(const void* data, size_t size) {
+  const auto begin = reinterpret_cast<uintptr_t>(data);
+  const auto end = begin + size;
+  // The first merged range ending after begin: it overlaps when it starts before end.
+  const auto it = std::upper_bound(sReads.begin(), sReads.end(), begin,
+                                   [](uintptr_t value, const auto& range) { return value < range.second; });
+  return it != sReads.end() && it->first < end;
 }
 
 bool aurora_replay_set_tunable(const char* name, float value) {

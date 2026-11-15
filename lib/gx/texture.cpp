@@ -4,6 +4,7 @@
 #include "../gfx/tex_palette_conv.hpp"
 #include "../gfx/texture_convert.hpp"
 #include "../gfx/texture_replacement.hpp"
+#include "replay.hpp"
 #include "shader_info.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -610,6 +611,7 @@ void invalidate_replacement(uint64_t replacementId) noexcept {
 
 gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
   ZoneScoped;
+  replay::note_read(obj.data, texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count()));
 
   if (obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
@@ -660,6 +662,8 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
 
 gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut) {
   ZoneScoped;
+  replay::note_read(obj.data, texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count()));
+  replay::note_read(tlut.data, tlut_source_size(tlut.numEntries));
 
   if (obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {

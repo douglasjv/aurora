@@ -269,6 +269,7 @@ ProcessResult process(const u8* data, u32 size) noexcept {
                     "indexed XF load outside array {}: offset={}, size={}, array size={}", arrayType, srcOffset,
                     srcSize, array.size);
       auto const* srcData = static_cast<const u8*>(array.data) + srcOffset;
+      replay::note_read(array.data, array.size);
       if (!copy_xf_data(dstAddr, srcData, len, array.le ? std::endian::little : std::endian::big)) {
 #ifndef NDEBUG
         Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr=%04x)", opcode, dstAddr);
@@ -395,6 +396,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       continue;
     }
     auto& array = state.arrays[i];
+    replay::note_read(array.data, array.size);
     if (array.cachedRange.size == 0) {
       array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
     }
@@ -655,6 +657,10 @@ void handle_aurora(ByteReader& reader) noexcept {
       slot.texDataVersion = newTexDataVersion;
       g_gxState.dirty |= DirtyTextures;
     }
+    if (slot.has_data()) {
+      replay::note_read(slot.data, texture::texture_source_size(slot.format(), slot.width(), slot.height(),
+                                                                slot.mip_count()));
+    }
   } else if (subCmd == GX_AURORA_LOAD_TLUT) {
     const auto idx = reader.read<u8>();
     CHECK(idx < MaxTluts, "invalid tlut slot {}", idx);
@@ -678,6 +684,7 @@ void handle_aurora(ByteReader& reader) noexcept {
       slot.flags = newFlags;
       g_gxState.dirty |= DirtyTextures;
     }
+    replay::note_read(slot.data, texture::tlut_source_size(slot.numEntries));
   } else if (subCmd == GX2_SET_POLYGON_OFFSET) {
     const f32 frontOffset = reader.read<f32>();
     const f32 frontScale = reader.read<f32>();

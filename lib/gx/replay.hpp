@@ -26,6 +26,10 @@ bool replaying() noexcept;
 void fail(const char* why) noexcept;
 bool failed() noexcept;
 
+// The first decode of a kept frame read `size` bytes of game memory at `data` (vertex
+// arrays, indexed matrix loads, textures, TLUTs): a replay may read them again.
+void note_read(const void* data, size_t size) noexcept;
+
 // Around build_uniform: records the draw's matrices (first decode) or swaps in the
 // blended ones (replay). after_uniform puts the state's matrices back.
 void before_uniform(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount) noexcept;

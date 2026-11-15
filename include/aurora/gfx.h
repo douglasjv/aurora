@@ -2,10 +2,12 @@
 #define AURORA_GFX_H
 
 #ifdef __cplusplus
+#include <cstddef>
 #include <cstdint>
 
 extern "C" {
 #else
+#include <stddef.h>
 #include "stdint.h"
 #endif
 
@@ -65,6 +67,10 @@ void aurora_replay_close_tick();
 void aurora_end_frame_hidden();
 bool aurora_replay_draw(float blend);
 void aurora_replay_end_tick();
+// Whether the last closed tick's first decode read game memory overlapping [data, data +
+// size) (vertex arrays, indexed matrix loads, textures, TLUTs), so its replays would read
+// it again: a block the game freed during the tick matters only if this is true.
+bool aurora_replay_reads(const void* data, size_t size);
 // maxturn, jumprel, jumpabs, cutmin, cutfraction, nearestmax, blend (0 draws replays unblended).
 bool aurora_replay_set_tunable(const char* name, float value);
 const AuroraReplayStats* aurora_replay_stats();
