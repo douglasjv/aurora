@@ -3,6 +3,8 @@
 #include "replay.hpp"
 
 #include "command_processor.hpp"
+#include "dolphin/gx/GXAurora.h"
+#include "dolphin/gx/GXCommandList.h"
 #include "fifo.hpp"
 #include "gx.hpp"
 #include "texture.hpp"
@@ -110,6 +112,7 @@ struct DrawRecord {
   float radius = 0.f;
   s32 match = -1;
   s32 view = -1;      // the view it was drawn under (index in sViews), -1 none
+  bool identity = false; // drawn with the identity (positions already in view space)
   bool inWorld = false; // set when the tick closes (camera=1): its positions are in sWorldPositions
   bool world = false; // ... and it blends with its match there
   u64 posHash = 0;   // its positions' values: a draw that did not move has the same
@@ -222,18 +225,13 @@ Tunables sTunables;
 AuroraReplayStats sStats{};
 
 std::vector<u8> sCapture;
-// The kept tick's marks: where in sCapture, and what. A pass to draw again
-// (aurora_replay_mark): the callback and its payload's place in sMarkBytes. A view
-// (aurora_replay_view): its index in sViews, -1 none. A task (aurora_replay_task).
-enum MarkKind : u8 { MarkPass, MarkView, MarkTask };
+// The kept tick's marks (aurora_replay_mark): where in sCapture, the callback, and its
+// payload's place in sMarkBytes.
 struct Mark {
   size_t offset;
-  AuroraReplayMarkCallback callback = nullptr;
-  u32 data = 0;
-  u32 size = 0;
-  MarkKind kind = MarkPass;
-  s32 view = -1;
-  u64 task = 0;
+  AuroraReplayMarkCallback callback;
+  u32 data;
+  u32 size;
 };
 std::vector<Mark> sMarks;
 std::vector<u8> sMarkBytes;
@@ -317,8 +315,20 @@ struct WorldMatrices {
   std::array<Affine, MaxPnMtx> pos;
   std::array<Affine, MaxPnMtx> nrm;
 };
+// Each tick's anchor (where the camera of its last view stands, in world space) and its views
+// as seen from there (x -> view(x + anchor)), with their inverses (prepare_views).
+std::array<double, 3> sAnchor{};
+std::array<double, 3> sPrevAnchor{};
+bool sHasAnchor = false;
+bool sPrevHasAnchor = false;
+std::vector<Affine> sRelViews;
+std::vector<Affine> sRelInverses;
+std::vector<u8> sRelInvertible;
 std::vector<WorldMatrices> sWorldRecords;     // by this tick's record
 std::vector<WorldMatrices> sPrevWorldRecords; // by the previous tick's
+bool sWrittenView = false;               // the last view command written in the kept tick ...
+std::array<float, 12> sWrittenViewMatrix{}; // ... and its matrix
+u64 sWrittenTask = 0;                    // the last task command written in the kept tick
 u32 sTickDrawsInTask = 0;    // draws of the tick being kept made inside a task
 u32 sTickDrawsUnderView = 0; // ... and under a view
 
@@ -787,6 +797,45 @@ void transform_direction(const Affine& m, const float* in, float* out) noexcept 
   for (int r = 0; r < 3; ++r) {
     out[r] = f[r * 4] * in[0] + f[r * 4 + 1] * in[1] + f[r * 4 + 2] * in[2];
   }
+}
+
+// Where a view looks from, in world space: -L^-1 t, in double. False when singular.
+bool view_position(const Affine& v, std::array<double, 3>& out) noexcept {
+  const auto f = flat(v);
+  const double a = f[0], b = f[1], c = f[2], d = f[4], e = f[5], g = f[6], h = f[8], i = f[9], k = f[10];
+  const double det = a * (e * k - g * i) - b * (d * k - g * h) + c * (d * i - e * h);
+  if (!std::isfinite(det) || std::abs(det) < 1e-20) {
+    return false;
+  }
+  const double r[9] = {
+      (e * k - g * i) / det, (c * i - b * k) / det, (b * g - c * e) / det,
+      (g * h - d * k) / det, (a * k - c * h) / det, (c * d - a * g) / det,
+      (d * i - e * h) / det, (b * h - a * i) / det, (a * e - b * d) / det,
+  };
+  for (int row = 0; row < 3; ++row) {
+    out[row] = -(r[row * 3] * f[3] + r[row * 3 + 1] * f[7] + r[row * 3 + 2] * f[11]);
+  }
+  return true;
+}
+
+// A view as seen from an anchor: x -> view(x + anchor), its translation worked in double.
+Affine shift_view(const Affine& v, const std::array<double, 3>& anchor) noexcept {
+  auto f = flat(v);
+  for (int r = 0; r < 3; ++r) {
+    f[r * 4 + 3] = static_cast<float>(static_cast<double>(f[r * 4 + 3]) + f[r * 4] * anchor[0] +
+                                      f[r * 4 + 1] * anchor[1] + f[r * 4 + 2] * anchor[2]);
+  }
+  return from_flat(f.data());
+}
+
+// A move in world space as seen from an anchor: x -> move(x + anchor) - anchor.
+Affine relative_move(const Affine& m, const std::array<double, 3>& anchor) noexcept {
+  auto f = flat(m);
+  for (int r = 0; r < 3; ++r) {
+    f[r * 4 + 3] = static_cast<float>(static_cast<double>(f[r * 4 + 3]) + f[r * 4] * anchor[0] +
+                                      f[r * 4 + 1] * anchor[1] + f[r * 4 + 2] * anchor[2] - anchor[r]);
+  }
+  return from_flat(f.data());
 }
 
 // The camera between two views: its place (the inverse of a view) blended, the position
@@ -1523,27 +1572,54 @@ void match_draws(u32& matched, u32& rejected) noexcept {
 void prepare_world() noexcept {
   sWorldRecords.clear();
   sWorldPositions.clear();
-  if (sTunables.camera == 0.f) {
+  if (sTunables.camera == 0.f || sRelViews.empty()) {
     return;
   }
-  std::vector<Affine> cameras(sViews.size());
-  std::vector<u8> invertible(sViews.size());
-  for (size_t v = 0; v < sViews.size(); ++v) {
-    invertible[v] = invert(sViews[v], cameras[v]);
+  const bool paired = sViews.size() == sPrevViews.size() && sPrevHasAnchor;
+  // The previous tick's world data was kept relative to its own anchor: move it to this one's.
+  float shift[3] = {};
+  for (int c = 0; c < 3; ++c) {
+    shift[c] = static_cast<float>(sPrevAnchor[c] - sAnchor[c]);
   }
-  const bool paired = !sViews.empty() && sViews.size() == sPrevViews.size();
+  if (paired) {
+    for (auto& w : sPrevWorldRecords) {
+      if (!w.valid) {
+        continue;
+      }
+      for (auto& m : w.pos) {
+        m.m0.m[3] += shift[0];
+        m.m1.m[3] += shift[1];
+        m.m2.m[3] += shift[2];
+      }
+    }
+    if (sPrevWorldPositions.size() == sPrevPositions.size()) {
+      for (const auto& d : sPrevDraws) {
+        if (!d.inWorld) {
+          continue;
+        }
+        for (u32 v = 0; v < d.key.vtxCount; ++v) {
+          for (int c = 0; c < 3; ++c) {
+            sPrevWorldPositions[d.first + v * 3 + c] += shift[c];
+          }
+        }
+      }
+    }
+  }
+  // Records: only those whose positions are the model's own (indexed arrays). A draw with its
+  // positions in the stream was moved by the CPU, already under the view: its positions carry
+  // its motion, and its matrix (the identity, mostly) is not where it is.
   sWorldRecords.resize(sCurrent.size());
   for (size_t i = 0; i < sCurrent.size(); ++i) {
     auto& r = sCurrent[i];
     r.world = false;
-    if (r.view < 0 || !invertible[r.view]) {
+    if (r.view < 0 || !sRelInvertible[r.view] || r.key.posDesc == GX_DIRECT) {
       continue;
     }
     auto& w = sWorldRecords[i];
     w.valid = true;
     for (u32 k = 0; k < MaxPnMtx; ++k) {
-      w.pos[k] = compose(cameras[r.view], r.m.pos[k]);
-      w.nrm[k] = compose(cameras[r.view], r.m.nrm[k], true);
+      w.pos[k] = compose(sRelInverses[r.view], r.m.pos[k]);
+      w.nrm[k] = compose(sRelInverses[r.view], r.m.nrm[k], true);
     }
     if (paired && r.match >= 0 && static_cast<size_t>(r.match) < sPrevWorldRecords.size() &&
         sPrevWorldRecords[r.match].valid) {
@@ -1555,15 +1631,16 @@ void prepare_world() noexcept {
       }
     }
   }
+  // Position draws: those drawn with the identity, whose positions are in view space.
   sWorldPositions = sPositions;
   for (auto& d : sDraws) {
     d.inWorld = false;
     d.world = false;
-    if (d.view < 0 || !invertible[d.view] || d.posCount != 3) {
+    if (d.view < 0 || !sRelInvertible[d.view] || d.posCount != 3 || !d.identity) {
       continue;
     }
     for (u32 v = 0; v < d.key.vtxCount; ++v) {
-      transform_point(cameras[d.view], &sPositions[d.first + v * 3], &sWorldPositions[d.first + v * 3]);
+      transform_point(sRelInverses[d.view], &sPositions[d.first + v * 3], &sWorldPositions[d.first + v * 3]);
     }
     d.inWorld = true;
   }
@@ -1581,6 +1658,29 @@ void prepare_world() noexcept {
   }
   std::swap(sPositions, sWorldPositions);
   std::swap(sPrevPositions, sPrevWorldPositions);
+}
+
+// When the tick closes: its anchor (where the camera of its last view stands) and its views
+// as seen from there, with their inverses. Views and world data are worked relative to the
+// anchor so that the world map's large coordinates cost no precision: near the camera the
+// numbers are small.
+void prepare_views() noexcept {
+  sRelViews.clear();
+  sRelInverses.clear();
+  sRelInvertible.clear();
+  sHasAnchor = false;
+  if (sViews.empty()) {
+    return;
+  }
+  sAnchor = {};
+  view_position(sViews.back(), sAnchor);
+  sHasAnchor = true;
+  for (const auto& view : sViews) {
+    sRelViews.push_back(shift_view(view, sAnchor));
+    Affine inverse;
+    sRelInvertible.push_back(invert(sRelViews.back(), inverse));
+    sRelInverses.push_back(inverse);
+  }
 }
 
 // Pairs this tick's records with the previous tick's, once, when the tick closes.
@@ -1733,6 +1833,7 @@ void match() noexcept {
     }
   }
   match_draws(matched, rejected);
+  prepare_views();
   prepare_world();
   sStats.views = static_cast<u32>(sViews.size());
   sStats.tasks = static_cast<u32>(sTaskDraws.size());
@@ -1816,8 +1917,8 @@ void decode_range(const std::vector<u8>& bytes, size_t offset, size_t end) noexc
   }
 }
 
-// Decodes the kept stream, running each pass mark's callback and taking each view and task
-// where the first decode met it.
+// Decodes the kept stream, running each mark's callback where the first decode met it. The
+// views and tasks are commands in the stream (on_view, on_task), met where they were written.
 void decode(const std::vector<u8>& bytes) noexcept {
   size_t offset = 0;
   sView = -1;
@@ -1828,23 +1929,8 @@ void decode(const std::vector<u8>& bytes) noexcept {
       return;
     }
     offset = mark.offset;
-    switch (mark.kind) {
-    case MarkPass:
-      mark.callback(sMarkBytes.data() + mark.data, mark.size);
-      ++sStats.marksReplayed;
-      break;
-    case MarkView:
-      sView = mark.view;
-      break;
-    case MarkTask:
-      sTask = mark.task;
-      break;
-    }
-    // A draw after a view or task mark may be placed otherwise than the one before it, so its
-    // uniform is built again (not reused, not merged).
-    if (sPlacing && mark.kind != MarkPass) {
-      g_gxState.dirty |= DirtyUniform;
-    }
+    mark.callback(sMarkBytes.data() + mark.data, mark.size);
+    ++sStats.marksReplayed;
   }
   decode_range(bytes, offset, bytes.size());
 }
@@ -1879,6 +1965,41 @@ void fail(const char* why) noexcept {
 }
 
 bool failed() noexcept { return sFailed; }
+
+void on_view(const float* view) noexcept {
+  if (!sRecording && !sReplaying) {
+    return;
+  }
+  s32 index = -1;
+  if (view != nullptr) {
+    const Affine m = from_flat(view);
+    for (size_t i = 0; i < sViews.size() && index < 0; ++i) {
+      if (std::memcmp(&sViews[i], &m, sizeof(m)) == 0) {
+        index = static_cast<s32>(i);
+      }
+    }
+    if (index < 0 && sRecording) {
+      index = static_cast<s32>(sViews.size());
+      sViews.push_back(m);
+    }
+  }
+  sView = index;
+  // A draw after a view or task command may be placed otherwise than the one before it, so
+  // its uniform is built again (not reused, not merged).
+  if (sReplaying && sPlacing) {
+    g_gxState.dirty |= DirtyUniform;
+  }
+}
+
+void on_task(u64 task) noexcept {
+  if (!sRecording && !sReplaying) {
+    return;
+  }
+  sTask = task;
+  if (sReplaying && sPlacing) {
+    g_gxState.dirty |= DirtyUniform;
+  }
+}
 
 namespace {
 // A component of an array element, in the array's byte order.
@@ -2096,6 +2217,11 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
     probe.additive = g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacDst == GX_BL_ONE;
     probe.raw = static_cast<u32>(sRaw.size());
     probe.view = draw_view();
+    {
+      const auto& m = g_gxState.pnMtx[std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1)].pos;
+      static const float identity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+      probe.identity = std::memcmp(&m, identity, sizeof(identity)) == 0;
+    }
     sRaw.insert(sRaw.end(), data, data + static_cast<size_t>(vtxCount) * vtxSize);
     sDraws.push_back(probe);
     sTexturesPending = true;
@@ -2126,7 +2252,7 @@ const u8* vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, co
   const auto put = [&](u8* p, const float* value) {
     float viewed[3];
     if (world) {
-      transform_point(sViews[cur.view], value, viewed);
+      transform_point(sRelViews[cur.view], value, viewed);
       value = viewed;
     }
     for (u32 c = 0; c < cur.posCount; ++c) {
@@ -2314,7 +2440,7 @@ void blend_uniform(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount) noexcept {
     if (sCameraBlend) {
       const auto& wa = sPrevWorldRecords[cur.match];
       const auto& wb = sWorldRecords[it->second];
-      const Affine& view = sViews[cur.view];
+      const Affine& view = sRelViews[cur.view];
       for (u32 i = 0; i < MaxPnMtx; ++i) {
         state.pnMtx[i].pos = compose(view, blend_matrix(wa.pos[i], wb.pos[i], turns[i], t));
         state.pnMtx[i].nrm = compose(view, blend_matrix(wa.nrm[i], wb.nrm[i], turns[MaxPnMtx + i], t), true);
@@ -2400,7 +2526,7 @@ void place() noexcept {
   if (!p.invertible || (!p.moved && move == nullptr)) {
     return;
   }
-  const Affine delta = move != nullptr ? compose(p.camera, compose(*move, p.inverse)) : p.delta;
+  const Affine delta = move != nullptr ? compose(p.camera, compose(relative_move(*move, sAnchor), p.inverse)) : p.delta;
   swap_begin();
   for (auto& m : state.pnMtx) {
     m.pos = compose(delta, m.pos);
@@ -2426,27 +2552,32 @@ void place() noexcept {
 void prepare_placements() noexcept {
   sPlacing = false;
   sCameraBlend = sTunables.camera != 0.f && !sCut && sTunables.blend != 0.f && sMotion != 1.f &&
-                 !sViews.empty() && sViews.size() == sPrevViews.size();
-  sPlacements.assign(sViews.size(), Placement{});
+                 !sViews.empty() && sViews.size() == sPrevViews.size() && sRelViews.size() == sViews.size();
+  sPlacements.assign(sRelViews.size(), Placement{});
   const bool anyMoves = !sMoves.empty();
-  for (size_t v = 0; v < sViews.size(); ++v) {
+  for (size_t v = 0; v < sRelViews.size(); ++v) {
     Placement& p = sPlacements[v];
-    p.camera = sViews[v];
+    p.invertible = sRelInvertible[v] != 0;
+    if (!p.invertible) {
+      continue;
+    }
+    p.inverse = sRelInverses[v];
+    p.camera = sRelViews[v];
+    bool moved = sTunables.forceView != 0.f;
     if (sCameraBlend) {
-      p.camera = blend_camera(sPrevViews[v], sViews[v], sMotion);
+      p.camera = blend_camera(shift_view(sPrevViews[v], sAnchor), sRelViews[v], sMotion);
+      moved = true;
     }
     if (sCameraSet && std::memcmp(&sViews[v], &sViews.back(), sizeof(Affine)) == 0) {
-      p.camera = sCamera;
+      // A camera that is the view itself leaves the draws exactly as the tick has them.
+      p.camera = shift_view(sCamera, sAnchor);
+      moved = sTunables.forceView != 0.f || std::memcmp(&sCamera, &sViews[v], sizeof(Affine)) != 0;
     }
-    // A camera that is the view itself leaves the draws exactly as the tick has them.
-    p.moved = sTunables.forceView != 0.f || std::memcmp(&p.camera, &sViews[v], sizeof(Affine)) != 0;
-    if (p.moved || anyMoves) {
-      p.invertible = invert(sViews[v], p.inverse);
-      if (p.invertible) {
-        p.delta = compose(p.camera, p.inverse);
-      }
+    p.moved = moved;
+    if (moved || anyMoves) {
+      p.delta = compose(p.camera, p.inverse);
     }
-    sPlacing |= p.moved && p.invertible;
+    sPlacing |= moved;
   }
   sPlacing |= !sHidden.empty() || (anyMoves && !sViews.empty());
 }
@@ -2530,6 +2661,12 @@ void aurora_replay_begin_tick() {
   sWorldPositions.clear();
   sPrevWorldRecords = std::move(sWorldRecords);
   sWorldRecords.clear();
+  sPrevAnchor = sAnchor;
+  sPrevHasAnchor = sHasAnchor;
+  sHasAnchor = false;
+  sRelViews.clear();
+  sRelInverses.clear();
+  sRelInvertible.clear();
   sView = -1;
   sTask = 0;
   sTaskDraws.clear();
@@ -2537,6 +2674,8 @@ void aurora_replay_begin_tick() {
   sMoves.clear();
   sTickDrawsInTask = 0;
   sTickDrawsUnderView = 0;
+  sWrittenView = false;
+  sWrittenTask = 0;
   sDrawIndex = 0;
   sUvUnpaired = 0;
   sCurrentByHash.clear();
@@ -2631,43 +2770,44 @@ void aurora_replay_mark(AuroraReplayMarkCallback callback, const void* data, siz
   const auto at = static_cast<u32>(sMarkBytes.size());
   const auto* bytes = static_cast<const u8*>(data);
   sMarkBytes.insert(sMarkBytes.end(), bytes, bytes + size);
-  sMarks.push_back({.offset = sCapture.size(), .callback = callback, .data = at, .size = static_cast<u32>(size)});
+  sMarks.push_back({sCapture.size(), callback, at, static_cast<u32>(size)});
 }
 
+// Views and tasks go into the stream as commands (GX_AURORA_REPLAY_VIEW and _TASK), so the
+// first decode and the replays meet them exactly where the game drew, without draining the
+// FIFO early (a drain would decode the tick's draws sooner, and read textures the game
+// rewrites later in the tick before it does). Not inside a display list, whose buffer is the
+// game's and sized for the console.
 void aurora_replay_view(const float* view) {
-  if (!sCapturing) {
+  if (!sCapturing || fifo::in_display_list()) {
     return;
   }
-  // Everything the game wrote before the mark is decoded under the view before it.
-  fifo::drain();
-  s32 index = -1;
+  // The game loads one camera many times a tick (each object tree starts from it): written
+  // once until it changes.
+  if (view != nullptr ? sWrittenView && std::memcmp(sWrittenViewMatrix.data(), view, sizeof(float) * 12) == 0
+                      : !sWrittenView) {
+    return;
+  }
+  fifo::write_u8(GX_AURORA);
+  fifo::write_u16(GX_AURORA_REPLAY_VIEW);
+  fifo::write_u8(view != nullptr ? 1 : 0);
+  sWrittenView = view != nullptr;
   if (view != nullptr) {
-    const Affine m = from_flat(view);
-    // The game loads one camera many times a tick (each object tree starts from it): one view.
-    for (size_t i = 0; i < sViews.size() && index < 0; ++i) {
-      if (std::memcmp(&sViews[i], &m, sizeof(m)) == 0) {
-        index = static_cast<s32>(i);
-      }
-    }
-    if (index < 0) {
-      index = static_cast<s32>(sViews.size());
-      sViews.push_back(m);
+    for (int i = 0; i < 12; ++i) {
+      fifo::write_f32(view[i]);
+      sWrittenViewMatrix[i] = view[i];
     }
   }
-  if (index == sView) {
-    return;
-  }
-  sView = index;
-  sMarks.push_back({.offset = sCapture.size(), .kind = MarkView, .view = index});
 }
 
 void aurora_replay_task(uint64_t task) {
-  if (!sCapturing || task == sTask) {
+  if (!sCapturing || fifo::in_display_list() || task == sWrittenTask) {
     return;
   }
-  fifo::drain();
-  sTask = task;
-  sMarks.push_back({.offset = sCapture.size(), .kind = MarkTask, .task = task});
+  fifo::write_u8(GX_AURORA);
+  fifo::write_u16(GX_AURORA_REPLAY_TASK);
+  fifo::write_u64(task);
+  sWrittenTask = task;
 }
 
 void aurora_replay_hide_task(uint64_t task, bool hidden) {

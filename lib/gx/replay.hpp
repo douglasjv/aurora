@@ -73,6 +73,12 @@ bool crossfade_enabled() noexcept;
 // buffer valid until the next call; or the array's own bytes.
 const void* array_bytes(GXAttr attr, GXVtxFmt fmt, AttrArray& array, u32& size) noexcept;
 
+// The stream's view and task commands (GX_AURORA_REPLAY_VIEW, GX_AURORA_REPLAY_TASK), as the
+// first decode and each replay meet them: the camera and the task the draws after them are
+// under. Nothing outside a kept tick or a replay.
+void on_view(const float* view) noexcept;
+void on_task(u64 task) noexcept;
+
 // Around build_uniform: records the draw's matrices (first decode) or swaps in the
 // blended ones (replay). after_uniform puts the state's matrices back.
 void before_uniform(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount) noexcept;

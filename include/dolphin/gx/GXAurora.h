@@ -96,6 +96,19 @@ extern "C" {
  */
 #define GX_AURORA_DRAW_INDEXED 0x0041
 
+/**
+ * Frame replay (aurora_replay_view, include/aurora/gfx.h): the game's camera from here on.
+ * Followed by a u8, 1 when twelve f32 of a 3x4 row-major world-to-view matrix follow, 0 for
+ * none. Changes nothing drawn; only the replay reads it.
+ */
+#define GX_AURORA_REPLAY_VIEW 0x0050
+
+/**
+ * Frame replay (aurora_replay_task): the task whose draws follow. Followed by a u64 id (0 none).
+ * Changes nothing drawn; only the replay reads it.
+ */
+#define GX_AURORA_REPLAY_TASK 0x0051
+
 #define GX2_SET_POLYGON_OFFSET 0x1000
 
 
