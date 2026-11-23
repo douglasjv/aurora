@@ -152,6 +152,48 @@ TEST_F(ReplacementStreamingTest, StaleFailureDoesNotPoisonNewRegistration) {
   texture::unregister_replacement(newRegistration);
 }
 
+TEST_F(ReplacementStreamingTest, PrefetchQueuesALoadBeforeAnyBind) {
+  RecordingSource source;
+  testing::set_workers_paused(true);
+  const auto registration =
+      texture::register_virtual_replacement(VirtualPngPath, {.read = &RecordingSource::read, .userData = &source});
+  ASSERT_NE(registration.id, 0u);
+  const auto key = std::get<texture::TextureSourceKey>(registration.key);
+
+  // Nothing is registered under another key; nothing loads before a bind or a prefetch.
+  auto other = key;
+  other.textureHash = 3;
+  EXPECT_FALSE(texture::prefetch_replacement(other));
+  EXPECT_TRUE(source.paths.empty());
+
+  EXPECT_TRUE(texture::prefetch_replacement(key));
+  testing::set_workers_paused(false);
+  {
+    std::unique_lock lock{source.mutex};
+    ASSERT_TRUE(source.cv.wait_for(lock, 2s, [&] { return !source.paths.empty(); }));
+    EXPECT_EQ(source.paths.front(), VirtualPngPath);
+  }
+  texture::unregister_replacement(registration);
+}
+
+TEST_F(ReplacementStreamingTest, NotLoadedWithoutAReplacement) {
+  std::array<uint8_t, 64> data{};
+  GXTexObj_ obj{};
+  obj.data = data.data();
+  EXPECT_FALSE(replacement_loaded(obj, nullptr));
+
+  // Registered under another key: still none for this texture, and asking loads nothing.
+  RecordingSource source;
+  testing::set_workers_paused(true);
+  const auto registration =
+      texture::register_virtual_replacement(VirtualPngPath, {.read = &RecordingSource::read, .userData = &source});
+  ASSERT_NE(registration.id, 0u);
+  EXPECT_FALSE(replacement_loaded(obj, nullptr));
+  testing::set_workers_paused(false);
+  shutdown();
+  EXPECT_TRUE(source.paths.empty());
+}
+
 template <typename T>
 void write_u32(std::vector<uint8_t>& bytes, size_t offset, T value) {
   const uint32_t word = static_cast<uint32_t>(value);

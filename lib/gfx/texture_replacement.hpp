@@ -24,6 +24,8 @@ std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,
 bool should_build_source_key() noexcept;
 bool has_replacement(const GXTexObj_& obj) noexcept;
 bool has_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept;
+bool replacement_loaded(const GXTexObj_& obj, const GXTlutObj_* tlut) noexcept;
+bool prefetch_replacement(const texture::TextureSourceKey& key) noexcept;
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept;
 std::string build_texture_replacement_name(const texture::TextureSourceKey& sourceKey) noexcept;
 

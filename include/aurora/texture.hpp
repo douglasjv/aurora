@@ -105,6 +105,20 @@ void reload_replacement_directory(const std::filesystem::path& root, Replacement
 
 bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut = nullptr);
 
+/// Whether the replacement `obj` (with `tlut`) resolves to has an image loaded, its full image or a
+/// thumbnail of it, so binding the texture now draws the replacement rather than the original. false
+/// when it has no replacement, when the replacement's image is still loading on a worker thread
+/// (replacements load asynchronously, from the first bind on), or when it failed to load. Starts no
+/// load. A caller that draws a replacement differently from the original (another shape) asks this
+/// first: until the image is published the bind draws the original.
+bool replacement_loaded(const GXTexObj* obj, const GXTlutObj* tlut = nullptr);
+
+/// Starts loading the replacement registered under `key` (an exact key, no wildcard matching) on a
+/// worker thread, as the texture's first bind would, so its image is ready when the game binds it. The
+/// image is published at the end of a frame and kept in the replacement cache (evicted only past its
+/// budget). Returns false when nothing is registered under the key, or replacements load synchronously.
+bool prefetch_replacement(const TextureSourceKey& key);
+
 } // namespace aurora::texture
 
 #endif

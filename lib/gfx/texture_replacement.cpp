@@ -1773,6 +1773,15 @@ bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut) {
   }
   return gfx::texture_replacement::has_replacement(*obj_);
 }
+
+bool replacement_loaded(const GXTexObj* obj, const GXTlutObj* tlut) {
+  return gfx::texture_replacement::replacement_loaded(*reinterpret_cast<const GXTexObj_*>(obj),
+                                                      reinterpret_cast<const GXTlutObj_*>(tlut));
+}
+
+bool prefetch_replacement(const TextureSourceKey& key) {
+  return gfx::texture_replacement::prefetch_replacement(key);
+}
 } // namespace aurora::texture
 
 namespace aurora::gfx::texture_replacement {
@@ -1965,6 +1974,51 @@ bool has_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept {
   }
 
   return find_source_replacement_key_locked(build_source_key(obj, tlut)).has_value();
+}
+
+bool replacement_loaded(const GXTexObj_& obj, const GXTlutObj_* tlut) noexcept {
+  std::lock_guard lk(s_registryMutex);
+  if (s_entriesByKey.empty()) {
+    return false;
+  }
+
+  std::optional<ReplacementKey> key;
+  if (obj.data != nullptr) {
+    ReplacementKey pointerKey{TexturePointerKey{.data = obj.data}};
+    if (s_entriesByKey.contains(pointerKey)) {
+      key = pointerKey;
+    }
+  }
+  if (!key.has_value() && s_sourceEntryCount != 0) {
+    key = find_source_replacement_key_locked(tlut != nullptr ? build_source_key(obj, *tlut) : build_source_key(obj));
+  }
+  if (!key.has_value()) {
+    return false;
+  }
+
+  // What a bind would draw: the selected entry's cached image (find_replacement_for_key_locked).
+  const auto* entry = find_selected_entry_locked(*key);
+  const auto cache = s_cacheByKey.find(*key);
+  return entry != nullptr && cache != s_cacheByKey.end() && cache->second.id == entry->id &&
+         static_cast<bool>(cache->second.handle);
+}
+
+bool prefetch_replacement(const TextureSourceKey& key) noexcept {
+  if constexpr (!gx::texture::AsyncTextureReplacements) {
+    return false;
+  }
+  std::lock_guard lk(s_registryMutex);
+  const ReplacementKey replacementKey{key};
+  const auto* entry = find_selected_entry_locked(replacementKey);
+  if (entry == nullptr || entry->kind == EntryKind::Raw || s_failedIds.contains(entry->id)) {
+    return false;
+  }
+  if (const auto cache = s_cacheByKey.find(replacementKey);
+      cache != s_cacheByKey.end() && cache->second.id == entry->id && cache->second.tier == Tier::Full) {
+    return true;
+  }
+  queue_full_load(snapshot_entry(replacementKey, *entry));
+  return true;
 }
 
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept {
