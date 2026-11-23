@@ -91,6 +91,14 @@ void unregister_replacements(const ReplacementGroup& group);
 void unregister_replacements(const ReplacementKey& key);
 void clear_replacements();
 
+/// Off by default. When on, a replacement loaded with a single mip level and no _mipN sidecars, in
+/// an 8-bit RGBA layout (PNGs), gets the rest of its mip chain built by box filtering as it loads,
+/// and replacements are sampled with linear mip filtering even where the game asked for none. A
+/// pack painted at several times the game's size otherwise shimmers wherever it is drawn small.
+/// Set it before textures load; textures already loaded keep their levels.
+void set_generate_replacement_mipmaps(bool enabled) noexcept;
+bool generate_replacement_mipmaps() noexcept;
+
 ReplacementGroup load_replacement_directory(const std::filesystem::path& root, ReplacementOptions options = {});
 void reload_replacement_directory(const std::filesystem::path& root, ReplacementGroup& group,
                                   ReplacementOptions options = {});

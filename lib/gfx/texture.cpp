@@ -8,6 +8,8 @@
 #include "texture_convert.hpp"
 #include "../gx/gx_fmt.hpp"
 
+#include <aurora/texture.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -314,7 +316,8 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
     minLod = 0.f;
     maxLod = 1000.f;
     if (!mipsEnabled) {
-      mipFilter = wgpu::MipmapFilterMode::Nearest;
+      mipFilter = aurora::texture::generate_replacement_mipmaps() ? wgpu::MipmapFilterMode::Linear
+                                                                  : wgpu::MipmapFilterMode::Nearest;
     }
   } else if (mipFilter == wgpu::MipmapFilterMode::Undefined) {
     minLod = 0.f;
