@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -452,6 +454,71 @@ std::optional<gfx::ConvertedTexture> load_texture_file(const std::filesystem::pa
   return gfx::dds::load_dds_file(path);
 }
 
+std::atomic_bool s_generateMips{false};
+
+bool is_rgba8_layout(wgpu::TextureFormat format) noexcept {
+  return format == wgpu::TextureFormat::RGBA8Unorm || format == wgpu::TextureFormat::RGBA8UnormSrgb ||
+         format == wgpu::TextureFormat::BGRA8Unorm || format == wgpu::TextureFormat::BGRA8UnormSrgb;
+}
+
+// Builds the rest of the mip chain for a single-level 8-bit RGBA texture, each level the 2x2 box
+// average of the one above (an odd edge repeats its last texel), down to 1x1. Without it a
+// replacement drawn much smaller than its size samples only its top level and shimmers.
+bool generate_mipmaps(gfx::ConvertedTexture& texture) noexcept {
+  if (texture.mips != 1 || !is_rgba8_layout(texture.format) || texture.width == 0 || texture.height == 0) {
+    return false;
+  }
+  const uint32_t levels = 1u + static_cast<uint32_t>(std::bit_width(std::max(texture.width, texture.height)) - 1);
+  if (levels <= 1) {
+    return false;
+  }
+  const uint64_t n = gfx::calc_texture_size(texture.format, texture.width, texture.height, levels);
+  const uint64_t top = uint64_t{texture.width} * texture.height * 4;
+  if (n == 0 || texture.data.size() < top) {
+    return false;
+  }
+  ByteBuffer blob{n};
+  uint8_t* const dst = blob.data();
+  std::memcpy(dst, texture.data.data(), top);
+  const uint8_t* src = dst;
+  uint8_t* out = dst + top;
+  uint32_t w = texture.width;
+  uint32_t h = texture.height;
+  for (uint32_t level = 1; level < levels; ++level) {
+    const uint32_t nw = std::max(w >> 1, 1u);
+    const uint32_t nh = std::max(h >> 1, 1u);
+    if (static_cast<uint64_t>(out - dst) + uint64_t{nw} * nh * 4 > n) {
+      return false;
+    }
+    for (uint32_t y = 0; y < nh; ++y) {
+      const uint32_t y0 = std::min(y * 2, h - 1);
+      const uint32_t y1 = std::min(y * 2 + 1, h - 1);
+      for (uint32_t x = 0; x < nw; ++x) {
+        const uint32_t x0 = std::min(x * 2, w - 1);
+        const uint32_t x1 = std::min(x * 2 + 1, w - 1);
+        const uint8_t* a = src + (uint64_t{y0} * w + x0) * 4;
+        const uint8_t* b = src + (uint64_t{y0} * w + x1) * 4;
+        const uint8_t* c = src + (uint64_t{y1} * w + x0) * 4;
+        const uint8_t* d = src + (uint64_t{y1} * w + x1) * 4;
+        uint8_t* o = out + (uint64_t{y} * nw + x) * 4;
+        for (int k = 0; k < 4; ++k) {
+          o[k] = static_cast<uint8_t>((a[k] + b[k] + c[k] + d[k] + 2) / 4);
+        }
+      }
+    }
+    src = out;
+    out += uint64_t{nw} * nh * 4;
+    w = nw;
+    h = nh;
+  }
+  if (static_cast<uint64_t>(out - dst) != n) {
+    return false;
+  }
+  texture.mips = levels;
+  texture.data = std::move(blob);
+  return true;
+}
+
 bool remove_mipmaps(gfx::ConvertedTexture& texture) noexcept {
   if (texture.mips <= 1) {
     return true;
@@ -676,6 +743,10 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noex
   }
 
   if (more.empty()) {
+    if (s_generateMips.load(std::memory_order_relaxed) && !generate_mipmaps(*base)) {
+      Log.debug("texture_replacement: no mipmaps generated for {} (format {})", src.name(),
+                static_cast<uint32_t>(base->format));
+    }
     return base;
   }
 
@@ -1617,6 +1688,12 @@ ReplacementRegistration register_virtual_replacement(std::string_view path, Virt
   gx::clear_static_texture_cache();
   return registration;
 }
+
+void set_generate_replacement_mipmaps(bool enabled) noexcept {
+  s_generateMips.store(enabled, std::memory_order_relaxed);
+}
+
+bool generate_replacement_mipmaps() noexcept { return s_generateMips.load(std::memory_order_relaxed); }
 
 ReplacementGroup load_replacement_directory(const std::filesystem::path& root, ReplacementOptions options) {
   ReplacementGroup group;
