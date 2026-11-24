@@ -15,6 +15,8 @@ bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept;
 void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
                            wgpu::Extent3D sourceSize, uint32_t msaaSamples) noexcept;
 void after_submit() noexcept;
+// Whether a frame ending now would take the requested snapshot (--fps: such a frame is drawn).
+bool snapshot_due() noexcept;
 
 namespace testing {
 void reset() noexcept;

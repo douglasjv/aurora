@@ -424,6 +424,14 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
   cmd.CopyBufferToBuffer(storageBuffer, 0, readbackBuffer, 0, byteSize);
 }
 
+bool snapshot_due() noexcept {
+  if (!g_enabled) {
+    return false;
+  }
+  std::lock_guard lock{g_mutex};
+  return g_snapshotRequested && Clock::now() >= g_nextSnapshotTime;
+}
+
 void after_submit() noexcept {
   if (!g_enabled) {
     return;

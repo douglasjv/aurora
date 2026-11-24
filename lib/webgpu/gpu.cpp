@@ -945,11 +945,15 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         }
         requiredFeatures.push_back(feature);
       }
+      // Tracy's GPU zones, or AURORA_GPU_TIMES (gpu_prof.cpp), time passes with timestamps.
 #ifdef TRACY_ENABLE
-      if (feature == wgpu::FeatureName::TimestampQuery) {
+      constexpr bool timestamps = true;
+#else
+      const bool timestamps = std::getenv("AURORA_GPU_TIMES") != nullptr;
+#endif
+      if (feature == wgpu::FeatureName::TimestampQuery && timestamps) {
         requiredFeatures.push_back(feature);
       }
-#endif
     }
     std::string featureList;
     for (auto featureName : requiredFeatures) {

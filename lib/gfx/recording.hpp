@@ -18,6 +18,12 @@ void begin_recording(FramePacket& packet, size_t frameSlot);
 RecordedFrame end_recording();
 void shutdown_recording();
 void increment_merged_draw_count() noexcept;
+// --fps (gx/replay.cpp): holds the current frame's ops back from the render worker until the
+// frame ends, so a frame that turns out hidden can skip its passes (discard_deferred_frame).
+void defer_frame_encoding() noexcept;
+// The deferred frame is never shown and every picture of it is drawn again by the replays:
+// encode only its uploads (staging copies), unless it reads anything back.
+void discard_deferred_frame() noexcept;
 
 namespace testing {
 void suppress_render_worker(bool suppress) noexcept;

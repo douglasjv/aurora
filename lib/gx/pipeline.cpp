@@ -10,6 +10,8 @@
 
 #include <tracy/Tracy.hpp>
 
+#include <cstdlib>
+
 namespace aurora::gx {
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
@@ -65,20 +67,37 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   const auto& resources = gfx::detail::resources();
   pass.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
   const std::array offsets{data.uniformRange.offset};
-  pass.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
-  if (data.bindGroups.textureBindGroup) {
-    pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
+  if (!gfx::debug_bind_once(false)) {
+    pass.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
   }
-  pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+  if (data.bindGroups.textureBindGroup && !gfx::debug_bind_once(true)) {
+    pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
+    gfx::note_texture_bind();
+  }
+  // The shared index buffer is bound once a pass; a draw's range is its first index
+  // (AURORA_INDEX_REBIND=1 binds each draw's range as before, for comparing).
+  static const bool rebind = [] {
+    const char* env = std::getenv("AURORA_INDEX_REBIND");
+    return env != nullptr && env[0] == '1';
+  }();
+  uint32_t firstIndex = 0;
+  if (rebind) {
+    pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+  } else if (data.indexCount != 0) {
+    gfx::bind_index_buffer(pass);
+    firstIndex = static_cast<uint32_t>(data.idxRange.offset / sizeof(uint16_t));
+  }
   if (data.dstAlpha != UINT32_MAX) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
   }
+  const uint32_t instances = gfx::debug_empty_draws() ? 0 : data.instanceCount;
   const auto draw = [&] {
+    gfx::note_gx_draw(uint64_t(data.indexCount != 0 ? data.indexCount : data.vtxCount) * instances);
     if (data.indexCount == 0) {
-      pass.Draw(data.vtxCount, data.instanceCount);
+      pass.Draw(data.vtxCount, instances);
     } else {
-      pass.DrawIndexed(data.indexCount, data.instanceCount);
+      pass.DrawIndexed(data.indexCount, instances, firstIndex);
     }
   };
   if (pipeline.prepass) {

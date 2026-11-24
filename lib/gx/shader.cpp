@@ -10,7 +10,10 @@
 #include <dolphin/gx/GXEnum.h>
 
 #include <absl/container/flat_hash_set.h>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <set>
 #include <string_view>
 #include <utility>
 
@@ -663,7 +666,129 @@ struct AttrAddress {
   std::string offs;
   std::string_view buf;
   bool le;
+  int win = -1; // with the vertex window: the attribute's byte offset in the vertex (offs unused)
 };
+
+// The vertex window. With one vertex an invocation (no line or point expansion), the words
+// holding the vertex's bytes in vbuf are loaded once and realigned to the vertex's first byte
+// (va<i> holds vertex bytes 4i..4i+3), so each direct attribute, and each index of an indexed
+// one, is read at a byte offset known when the shader is built. The per-attribute path loads
+// up to two words a component and branches on the vertex's alignment at run time, which on a
+// tile-based GPU is paid in the binning pass and again in every bin the triangle touches.
+// The same bytes go through the same conversions, so the values are identical.
+struct VertexWindow {
+  std::set<u32> aligned;
+
+  // Bytes [off, off + bytes) of the vertex as load_u32_raw would return them (first byte lowest).
+  std::string raw(u32 off, u32 bytes) {
+    const u32 i = off / 4;
+    const u32 shift = (off % 4) * 8;
+    const u32 bits = bytes * 8;
+    aligned.insert(i);
+    if (shift + bits <= 32) {
+      if (bits == 32) {
+        return fmt::format("va{}", i);
+      }
+      return fmt::format("extractBits(va{}, {}u, {}u)", i, shift, bits);
+    }
+    aligned.insert(i + 1);
+    auto v = fmt::format("((va{} >> {}u) | (va{} << {}u))", i, shift, i + 1, 32 - shift);
+    if (bits == 32) {
+      return v;
+    }
+    return fmt::format("({} & {:#x}u)", v, (1u << bits) - 1);
+  }
+
+  std::string declarations(u32 vtxStride) const {
+    if (aligned.empty()) {
+      return {};
+    }
+    std::set<u32> words;
+    for (const u32 i : aligned) {
+      words.insert(i);
+      words.insert(i + 1);
+    }
+    std::string out = fmt::format("\n    let vbyte = imm.vtx_start + vidx * {}u;"
+                                  "\n    let vword = vbyte >> 2u;"
+                                  "\n    let vsh = (vbyte & 3u) * 8u;",
+                                  vtxStride);
+    for (const u32 w : words) {
+      out += fmt::format("\n    let vw{} = load_word(&vbuf, vword + {}u);", w, w);
+    }
+    // (x << 1u) << (31u - vsh) is x << (32 - vsh), and 0 when the vertex is word-aligned.
+    for (const u32 i : aligned) {
+      out += fmt::format("\n    let va{} = (vw{} >> vsh) | ((vw{} << 1u) << (31u - vsh));", i, i, i + 1);
+    }
+    return out;
+  }
+};
+thread_local VertexWindow* t_window = nullptr;
+// AURORA_VERTEX_WINDOW=0 builds shaders with the per-attribute loads instead (for comparing).
+const bool VertexWindowEnabled = [] {
+  const char* env = std::getenv("AURORA_VERTEX_WINDOW");
+  return env == nullptr || std::string_view{env} != "0";
+}();
+
+std::string vector_of(u32 cnt, const std::array<std::string, 4>& comps) {
+  switch (cnt) {
+  case 1:
+    return comps[0];
+  case 2:
+    return fmt::format("vec2f({}, {})", comps[0], comps[1]);
+  case 3:
+    return fmt::format("vec3f({}, {}, {})", comps[0], comps[1], comps[2]);
+  default:
+    return fmt::format("vec4f({}, {}, {}, {})", comps[0], comps[1], comps[2], comps[3]);
+  }
+}
+
+// fetch_attr reading the vertex window.
+auto fetch_attr_win(const AttrConfig& mapping, VertexWindow& win, u32 off, bool le) -> std::string {
+  std::array<std::string, 4> comps;
+  const u32 cnt = std::min<u32>(mapping.cnt, 4);
+  for (u32 j = 0; j < cnt; ++j) {
+    switch (mapping.compType) {
+    case GX_U8:
+      comps[j] = fmt::format("win_u8({}, {}u)", win.raw(off + j, 1), mapping.frac);
+      break;
+    case GX_S8:
+      comps[j] = fmt::format("win_s8({}, {}u)", win.raw(off + j, 1), mapping.frac);
+      break;
+    case GX_U16:
+      comps[j] = fmt::format("win_u16({}, {}u, {})", win.raw(off + 2 * j, 2), mapping.frac, le);
+      break;
+    case GX_S16:
+      comps[j] = fmt::format("win_s16({}, {}u, {})", win.raw(off + 2 * j, 2), mapping.frac, le);
+      break;
+    case GX_F32:
+      comps[j] = fmt::format("win_f32({}, {})", win.raw(off + 4 * j, 4), le);
+      break;
+    case GX_RGBA8:
+      return fmt::format("unpack4x8unorm({})", win.raw(off, 4));
+    default:
+      Log.fatal("fetch_attr_win: Unimplemented {}", static_cast<GXCompType>(mapping.compType));
+    }
+  }
+  return vector_of(cnt, comps);
+}
+
+auto fetch_color_attr_win(const AttrConfig& mapping, VertexWindow& win, u32 off, bool le) -> std::string {
+  switch (mapping.compType) {
+  case GX_RGB565:
+    return fmt::format("win_rgb565(bswap16({}, {}))", win.raw(off, 2), le);
+  case GX_RGB8:
+  case GX_RGBX8:
+    return fmt::format("win_rgb8({})", win.raw(off, 3));
+  case GX_RGBA4:
+    return fmt::format("win_rgba4(bswap16({}, {}))", win.raw(off, 2), le);
+  case GX_RGBA6:
+    return fmt::format("win_rgba6(win_u24({}, {}))", win.raw(off, 3), le);
+  case GX_RGBA8:
+    return fmt::format("win_rgba8({})", win.raw(off, 4));
+  default:
+    Log.fatal("fetch_color_attr_win: Unimplemented {}", static_cast<GXCompType>(mapping.compType));
+  }
+}
 
 // Immediates cannot contain arrays, so array_start is packed as three vec4u.
 std::string imm_array_start(GXAttr attr) noexcept {
@@ -674,6 +799,19 @@ std::string imm_array_start(GXAttr attr) noexcept {
 auto attr_address(const AttrConfig& mapping, GXAttr attr, std::string_view vidx, u32 vtxStride, u32 dlExtra, u32 within)
     -> AttrAddress {
   const u32 dlOffset = mapping.offset + dlExtra;
+  if (t_window != nullptr && vidx == "vidx"sv) {
+    auto& win = *t_window;
+    if (mapping.attrType == GX_INDEX8) {
+      return {fmt::format("{} + {} * {}u + {}u", imm_array_start(attr), win.raw(dlOffset, 1), mapping.stride, within),
+              "abuf"sv, mapping.le};
+    }
+    if (mapping.attrType == GX_INDEX16) {
+      return {fmt::format("{} + bswap16({}, false) * {}u + {}u", imm_array_start(attr), win.raw(dlOffset, 2),
+                          mapping.stride, within),
+              "abuf"sv, mapping.le};
+    }
+    return {{}, "vbuf"sv, false, int(dlOffset + within)};
+  }
   if (mapping.attrType == GX_INDEX8) {
     return {fmt::format("{} + raw_fetch_u8_1(&vbuf, imm.vtx_start + {} * {}u + {}u) * {}u + {}u", imm_array_start(attr),
                         vidx, vtxStride, dlOffset, mapping.stride, within),
@@ -692,7 +830,40 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
   if (mapping.attrType == GX_NONE) {
     return vtx_attr(config, attr);
   }
-  const auto [offs, buf, le] = attr_address(mapping, attr, vidx, config.vtxStride, 0u, 0u);
+  const auto [offs, buf, le, win] = attr_address(mapping, attr, vidx, config.vtxStride, 0u, 0u);
+  if (win >= 0) {
+    auto& w = *t_window;
+    const u32 off = u32(win);
+    switch (attr) {
+    case GX_VA_PNMTXIDX:
+      return fmt::format("({} / 3u)", w.raw(off, 1));
+    case GX_VA_TEX0MTXIDX:
+    case GX_VA_TEX1MTXIDX:
+    case GX_VA_TEX2MTXIDX:
+    case GX_VA_TEX3MTXIDX:
+    case GX_VA_TEX4MTXIDX:
+    case GX_VA_TEX5MTXIDX:
+    case GX_VA_TEX6MTXIDX:
+    case GX_VA_TEX7MTXIDX:
+      return w.raw(off, 1);
+    case GX_VA_POS: {
+      const auto posLoad = fetch_attr_win(mapping, w, off, le);
+      return mapping.cnt == 2 ? fmt::format("vec3f({}, 0.0)", posLoad) : posLoad;
+    }
+    case GX_VA_NRM: {
+      auto nrmMapping = mapping;
+      nrmMapping.cnt = std::min<u8>(mapping.cnt, 3);
+      return fetch_attr_win(nrmMapping, w, off, le);
+    }
+    case GX_VA_CLR0:
+    case GX_VA_CLR1:
+      return fetch_color_attr_win(mapping, w, off, le);
+    default: {
+      const auto texLoad = fetch_attr_win(mapping, w, off, le);
+      return mapping.cnt == 1 ? fmt::format("vec2f({}, 0.0)", texLoad) : texLoad;
+    }
+    }
+  }
   switch (attr) {
   case GX_VA_PNMTXIDX:
     return fmt::format("(raw_fetch_u8_1(&{}, {}) / 3u)", buf, offs);
@@ -764,9 +935,12 @@ auto attr_load_nbt_slice(const ShaderConfig& config, NbtSlice slice, std::string
     }
   }
   const u32 within = sliceIdx * 3u * compsize;
-  const auto [offs, buf, le] = attr_address(mapping, GX_VA_NRM, vidx, config.vtxStride, dlExtra, within);
+  const auto [offs, buf, le, win] = attr_address(mapping, GX_VA_NRM, vidx, config.vtxStride, dlExtra, within);
   auto sliceMapping = mapping;
   sliceMapping.cnt = 3;
+  if (win >= 0) {
+    return fetch_attr_win(sliceMapping, *t_window, u32(win), le);
+  }
   return fetch_attr(sliceMapping, buf, offs, le);
 }
 
@@ -1034,7 +1208,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     vtxXfrAttrsPre += "\n    let in_pnmtxidx = imm.current_pnmtx;";
   }
 
-  // Load vertex attributes
+  // Load vertex attributes (through the vertex window when there is one vertex an invocation)
+  VertexWindow window;
+  const bool useWindow = config.lineMode == 0 && VertexWindowEnabled;
+  t_window = useWindow ? &window : nullptr;
+  std::string attrLoads;
   for (GXAttr attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; attr = static_cast<GXAttr>(attr + 1)) {
     const auto attrType = config.attrs[attr].attrType;
     if (attrType == GX_NONE) {
@@ -1042,7 +1220,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     }
     // in_pnmtxidx and in_pos written above for line mode
     if ((attr != GX_VA_PNMTXIDX && attr != GX_VA_POS) || config.lineMode == 0) {
-      vtxXfrAttrsPre += fmt::format("\n    let {} = {};", vtx_attr(config, attr), attr_load(config, attr, vidxAttr));
+      attrLoads += fmt::format("\n    let {} = {};", vtx_attr(config, attr), attr_load(config, attr, vidxAttr));
     }
   }
   bool needsBinrm = false;
@@ -1056,13 +1234,16 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     needsTangent = needsTangent || config.tcgs[i].src == GX_TG_TANGENT || emboss;
   }
   if (needsBinrm) {
-    vtxXfrAttrsPre += fmt::format("\n    let {} = {};", nbt_slice_local(NbtSlice::B),
-                                  attr_load_nbt_slice(config, NbtSlice::B, vidxAttr));
+    attrLoads += fmt::format("\n    let {} = {};", nbt_slice_local(NbtSlice::B),
+                             attr_load_nbt_slice(config, NbtSlice::B, vidxAttr));
   }
   if (needsTangent) {
-    vtxXfrAttrsPre += fmt::format("\n    let {} = {};", nbt_slice_local(NbtSlice::T),
-                                  attr_load_nbt_slice(config, NbtSlice::T, vidxAttr));
+    attrLoads += fmt::format("\n    let {} = {};", nbt_slice_local(NbtSlice::T),
+                             attr_load_nbt_slice(config, NbtSlice::T, vidxAttr));
   }
+  t_window = nullptr;
+  vtxXfrAttrsPre += window.declarations(config.vtxStride);
+  vtxXfrAttrsPre += attrLoads;
 
   if (config.lineMode == 0) {
     vtxXfrAttrsPre += fmt::format(
@@ -1778,6 +1959,25 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFn += "\n    prev.a = 1.0;";
   }
 
+  // Debugging aids, never for play. AURORA_DEBUG_FRAGMENT=flat makes every fragment one grey
+  // (no texture samples, TEV or alpha test), leaving the vertex and per-bin cost without the
+  // shading; =uv shows texture coordinate 0 and =deriv its screen derivatives (grey without
+  // one), which tells a change in interpolation from one in the quads derivatives come from.
+  static const int debugFragments = [] {
+    const char* env = std::getenv("AURORA_DEBUG_FRAGMENT");
+    const std::string_view mode = env != nullptr ? env : "";
+    return mode == "flat" ? 1 : mode == "uv" ? 2 : mode == "deriv" ? 3 : 0;
+  }();
+  if (debugFragments == 1 || (debugFragments != 0 && fragmentFnPre.find("var tex0_uv") == std::string::npos)) {
+    fragmentFnPre = "\n    var prev: vec4f;";
+    fragmentFn = "\n    prev = vec4f(0.5, 0.5, 0.5, 1.0);";
+  } else if (debugFragments == 2) {
+    fragmentFn = "\n    prev = vec4f(fract(tex0_uv * 4.0), 0.0, 1.0);";
+  } else if (debugFragments == 3) {
+    fragmentFn = "\n    prev = vec4f(clamp(abs(dpdx(tex0_uv)) * 64.0, vec2f(0.0), vec2f(1.0)),"
+                 " clamp(abs(dpdy(tex0_uv.x)) * 64.0, 0.0, 1.0), 1.0);";
+  }
+
   std::string fragmentOutput;
   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
   std::string fragmentReturn = "\n    return prev;"s;
@@ -2127,6 +2327,73 @@ fn fetch_rgba8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
   return vec4f(v) / 255.0;
 }}
 
+fn win_u8(raw: u32, frac: u32) -> f32 {{
+  return f32(raw) / f32(1u << frac);
+}}
+
+fn win_s8(raw: u32, frac: u32) -> f32 {{
+  let v = (bitcast<i32>(raw) << 24) >> 24;
+  return f32(v) / f32(1u << frac);
+}}
+
+fn win_u16(raw: u32, frac: u32, le: bool) -> f32 {{
+  return f32(bswap16(raw, le)) / f32(1u << frac);
+}}
+
+fn win_s16(raw: u32, frac: u32, le: bool) -> f32 {{
+  let v = bitcast<i32>(bswap16(raw, le) << 16u) >> 16;
+  return f32(v) / f32(1u << frac);
+}}
+
+fn win_f32(raw: u32, le: bool) -> f32 {{
+  return bitcast<f32>(bswap32(raw, le));
+}}
+
+fn win_u24(raw: u32, le: bool) -> u32 {{
+  if (le) {{
+    return raw;
+  }}
+  return ((raw & 0x0000FFu) << 16u) |
+         (raw & 0x00FF00u) |
+         ((raw & 0xFF0000u) >> 16u);
+}}
+
+fn win_rgb565(v: u32) -> vec4f {{
+  return vec4f(
+    f32((v >> 11u) & 0x1Fu) / f32(0x1Fu),
+    f32((v >>  5u) & 0x3Fu) / f32(0x3Fu),
+    f32((v >>  0u) & 0x1Fu) / f32(0x1Fu),
+    1.0,
+  );
+}}
+
+fn win_rgb8(raw: u32) -> vec4f {{
+  return vec4f(f32(extractBits(raw, 0u, 8u)), f32(extractBits(raw, 8u, 8u)), f32(extractBits(raw, 16u, 8u)), 255.0) / 255.0;
+}}
+
+fn win_rgba4(v: u32) -> vec4f {{
+  return vec4f(
+    f32((v >> 12u) & 0x0Fu) / f32(0x0Fu),
+    f32((v >>  8u) & 0x0Fu) / f32(0x0Fu),
+    f32((v >>  4u) & 0x0Fu) / f32(0x0Fu),
+    f32((v >>  0u) & 0x0Fu) / f32(0x0Fu),
+  );
+}}
+
+fn win_rgba6(v: u32) -> vec4f {{
+  return vec4f(
+    f32((v >> 18u) & 0x3Fu) / f32(0x3Fu),
+    f32((v >> 12u) & 0x3Fu) / f32(0x3Fu),
+    f32((v >>  6u) & 0x3Fu) / f32(0x3Fu),
+    f32((v >>  0u) & 0x3Fu) / f32(0x3Fu),
+  );
+}}
+
+fn win_rgba8(raw: u32) -> vec4f {{
+  let v = vec4u(extractBits(raw, 0u, 8u), extractBits(raw, 8u, 8u), extractBits(raw, 16u, 8u), extractBits(raw, 24u, 8u));
+  return vec4f(v) / 255.0;
+}}
+
 fn tev_overflow_f32(in: f32) -> f32 {{
   let byte_space = in * 255.0;
   return (byte_space - floor(byte_space / 256.0) * 256.0) / 255.0;
@@ -2190,6 +2457,14 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
   }
   if (EnableDebugPrints) {
     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
+  }
+  // Profiling aid: AURORA_DUMP_SHADERS=<dir> writes each generated shader to <dir>/<hash>.wgsl.
+  static const char* dumpDir = std::getenv("AURORA_DUMP_SHADERS");
+  if (dumpDir != nullptr) {
+    if (FILE* f = std::fopen(fmt::format("{}/{:016x}.wgsl", dumpDir, hash).c_str(), "w")) {
+      std::fwrite(shaderSource.data(), 1, shaderSource.size(), f);
+      std::fclose(f);
+    }
   }
 
   return shaderSource;

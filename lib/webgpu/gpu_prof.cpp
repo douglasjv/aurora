@@ -3,18 +3,24 @@
 #include "../internal.hpp"
 #include "gpu.hpp"
 
+#include <aurora/gfx.h>
+#include "../gfx/encoding.hpp"
+#include "../gx/command_processor.hpp"
+
 #include <tracy/Tracy.hpp>
 
 #ifdef TRACY_ENABLE
-
 #include <tracy/TracyC.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bitset>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -107,6 +113,24 @@ const char* intern_name(std::string_view name) {
   return stable;
 }
 
+TimestampBounds event_bounds(const Slot& slot, const uint64_t* ts) {
+  TimestampBounds bounds;
+  for (const auto& event : slot.events) {
+    const uint64_t t = ts[event.query];
+    if (t == 0) {
+      continue;
+    }
+    if (bounds.begin == 0 || t < bounds.begin) {
+      bounds.begin = t;
+    }
+    if (t > bounds.end) {
+      bounds.end = t;
+    }
+  }
+  return bounds;
+}
+
+#ifdef TRACY_ENABLE
 // tracy::GpuContextType not exposed through TracyC.h
 uint8_t tracy_context_type(wgpu::BackendType backend) {
   switch (backend) {
@@ -160,23 +184,6 @@ void emit_zone_end(uint64_t gpuNs) {
   const uint16_t queryId = g_queryId++;
   ___tracy_emit_gpu_zone_end_serial({.queryId = queryId, .context = ContextId});
   ___tracy_emit_gpu_time_serial({.gpuTime = int64_t(gpuNs), .queryId = queryId, .context = ContextId});
-}
-
-TimestampBounds event_bounds(const Slot& slot, const uint64_t* ts) {
-  TimestampBounds bounds;
-  for (const auto& event : slot.events) {
-    const uint64_t t = ts[event.query];
-    if (t == 0) {
-      continue;
-    }
-    if (bounds.begin == 0 || t < bounds.begin) {
-      bounds.begin = t;
-    }
-    if (t > bounds.end) {
-      bounds.end = t;
-    }
-  }
-  return bounds;
 }
 
 void emit_frame(Slot& slot) {
@@ -279,6 +286,114 @@ void emit_frame(Slot& slot) {
   TracyPlot("aurora: gpuPasses", int64_t(slot.passCount));
 }
 
+#endif // TRACY_ENABLE
+
+
+// AURORA_GPU_TIMES=<frames>: without Tracy, adds up each pass's GPU time by its name (the
+// pass index dropped) and logs the averages every <frames> frames. Off when unset.
+uint32_t g_logEvery = 0;
+struct PassTotal {
+  double ns = 0;
+  uint64_t count = 0;
+};
+std::map<std::string, PassTotal> g_passTotals;
+double g_passNs = 0;
+uint32_t g_framesTimed = 0;
+uint32_t g_framesSkipped = 0;
+uint32_t g_framesUploadOnly = 0;
+
+std::string_view base_name(std::string_view name) {
+  size_t end = name.size();
+  while (end > 0 && name[end - 1] >= '0' && name[end - 1] <= '9') {
+    --end;
+  }
+  if (end < name.size() && end > 0 && name[end - 1] == ' ') {
+    --end;
+  }
+  return end > 0 ? name.substr(0, end) : name;
+}
+
+void accumulate(Slot& slot) {
+  const auto* ts = static_cast<const uint64_t*>(slot.readback.GetConstMappedRange(0, ReadbackSize));
+  if (ts == nullptr) {
+    return;
+  }
+  double passes = 0;
+  uint32_t depth = 0;
+  bool drew = false; // a pass besides the staging copies (a hidden frame skipped by replay has only those)
+  for (const auto& event : slot.events) {
+    if (event.kind == EventKind::End) {
+      --depth;
+      continue;
+    }
+    const uint64_t begin = ts[event.query];
+    const uint64_t end = ts[event.query + 1];
+    if (begin != 0 && end > begin && end - begin < SaneFrameGapNs) {
+      auto& total = g_passTotals[std::string{base_name(event.name)}];
+      total.ns += double(end - begin);
+      ++total.count;
+      if (depth == 0) {
+        passes += double(end - begin);
+        drew = drew || base_name(event.name) != "Staging copies";
+      }
+    }
+    ++depth;
+  }
+  if (passes == 0) {
+    ++g_framesSkipped; // no pass wrote its timestamps
+    return;
+  }
+  g_passNs += passes;
+  if (!drew) {
+    ++g_framesUploadOnly; // its uploads count toward the drawn frames' time
+    return;
+  }
+  if (++g_framesTimed < g_logEvery) {
+    return;
+  }
+  std::vector<std::pair<std::string, PassTotal>> rows{g_passTotals.begin(), g_passTotals.end()};
+  std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+  const double n = double(g_framesTimed);
+  const AuroraStats* stats = aurora_get_stats();
+  std::string line = fmt::format("GPU over {} frames: passes {:.2f} ms a frame ({} without timestamps, {} uploads only; last frame "
+                                 "{} draws, {} merged, verts {} KB, uniforms {} KB, indices {} KB, storage {} KB)",
+                                 g_framesTimed, g_passNs / n * 1e-6, g_framesSkipped, g_framesUploadOnly, stats->drawCallCount,
+                                 stats->mergedDrawCallCount, stats->lastVertSize / 1024, stats->lastUniformSize / 1024,
+                                 stats->lastIndexSize / 1024, stats->lastStorageSize / 1024);
+  uint64_t pipelines = 0;
+  uint64_t textures = 0;
+  uint64_t draws = 0;
+  uint64_t vertices = 0;
+  gfx::take_encode_counts(pipelines, textures, draws, vertices);
+  const double encoded = double(g_framesTimed + g_framesUploadOnly);
+  line += fmt::format("; a frame {:.0f} gx draws, {:.0f} pipeline binds, {:.0f} texture binds, {:.0f} vertices",
+                      draws / encoded, pipelines / encoded, textures / encoded, vertices / encoded);
+  {
+    std::array<uint64_t, 8> m{};
+    for (size_t i = 0; i < m.size(); ++i) {
+      m[i] = gx::fifo::g_mergeCounts[i].exchange(0, std::memory_order_relaxed);
+    }
+    line += fmt::format("; draws recorded {:.0f}: dirty pipeline {:.0f}, textures {:.0f}, uniform {:.0f}, immediates "
+                        "{:.0f}; clean but format {:.0f}, no draw before {:.0f}; mergeable {:.0f}",
+                        m[7] / encoded, m[0] / encoded, m[1] / encoded, m[2] / encoded, m[3] / encoded, m[4] / encoded,
+                        m[5] / encoded, m[6] / encoded);
+    std::array<uint64_t, 4> k{};
+    for (size_t i = 0; i < k.size(); ++i) {
+      k[i] = gx::fifo::g_mergeImmCounts[i].exchange(0, std::memory_order_relaxed);
+    }
+    line += fmt::format("; only immediates dirty: matrix {:.0f}, array invalidated {:.0f}, array moved {:.0f}, "
+                        "unchanged {:.0f}",
+                        k[0] / encoded, k[1] / encoded, k[2] / encoded, k[3] / encoded);
+  }
+  for (const auto& [name, total] : rows) {
+    line += fmt::format("; {} {:.3f} ms x{:.1f}", name, total.ns / n * 1e-6, double(total.count) / n);
+  }
+  Log.info("{}", line);
+  g_passTotals.clear();
+  g_passNs = 0;
+  g_framesTimed = g_framesSkipped = g_framesUploadOnly = 0;
+}
+
 Slot& record_slot() { return g_slots[g_recordSlot]; }
 
 uint32_t alloc_zone() {
@@ -290,6 +405,14 @@ uint32_t alloc_zone() {
 } // namespace
 
 void initialize() {
+  if (const char* every = std::getenv("AURORA_GPU_TIMES")) {
+    g_logEvery = uint32_t(std::strtoul(every, nullptr, 10));
+  }
+#ifndef TRACY_ENABLE
+  if (g_logEvery == 0) {
+    return;
+  }
+#endif
   g_enabled = g_device.HasFeature(wgpu::FeatureName::TimestampQuery);
   if (!g_enabled) {
     Log.info("Timestamp queries unsupported; GPU profiling disabled");
@@ -403,7 +526,14 @@ void after_submit() {
     auto& slot = g_slots[g_emitSlot];
     const auto state = slot.state.load(std::memory_order_acquire);
     if (state == SlotState::Mapped) {
-      emit_frame(slot);
+      if (g_logEvery != 0) {
+        accumulate(slot);
+      }
+#ifdef TRACY_ENABLE
+      else {
+        emit_frame(slot);
+      }
+#endif
       slot.readback.Unmap();
     } else if (state != SlotState::Failed) {
       break;
@@ -457,18 +587,3 @@ Zone::~Zone() {
 }
 
 } // namespace aurora::webgpu::gpu_prof
-
-#else
-
-namespace aurora::webgpu::gpu_prof {
-void initialize() {}
-void shutdown() {}
-void frame_begin(const wgpu::CommandEncoder&) {}
-void frame_end(const wgpu::CommandEncoder&) {}
-void after_submit() {}
-const wgpu::PassTimestampWrites* pass_writes(std::string_view) { return nullptr; }
-Zone::Zone(const wgpu::CommandEncoder&, std::string_view) {}
-Zone::~Zone() = default;
-} // namespace aurora::webgpu::gpu_prof
-
-#endif
