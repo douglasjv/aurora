@@ -1959,6 +1959,25 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentFn += "\n    prev.a = 1.0;";
   }
 
+  // Debugging aids, never for play. AURORA_DEBUG_FRAGMENT=flat makes every fragment one grey
+  // (no texture samples, TEV or alpha test), leaving the vertex and per-bin cost without the
+  // shading; =uv shows texture coordinate 0 and =deriv its screen derivatives (grey without
+  // one), which tells a change in interpolation from one in the quads derivatives come from.
+  static const int debugFragments = [] {
+    const char* env = std::getenv("AURORA_DEBUG_FRAGMENT");
+    const std::string_view mode = env != nullptr ? env : "";
+    return mode == "flat" ? 1 : mode == "uv" ? 2 : mode == "deriv" ? 3 : 0;
+  }();
+  if (debugFragments == 1 || (debugFragments != 0 && fragmentFnPre.find("var tex0_uv") == std::string::npos)) {
+    fragmentFnPre = "\n    var prev: vec4f;";
+    fragmentFn = "\n    prev = vec4f(0.5, 0.5, 0.5, 1.0);";
+  } else if (debugFragments == 2) {
+    fragmentFn = "\n    prev = vec4f(fract(tex0_uv * 4.0), 0.0, 1.0);";
+  } else if (debugFragments == 3) {
+    fragmentFn = "\n    prev = vec4f(clamp(abs(dpdx(tex0_uv)) * 64.0, vec2f(0.0), vec2f(1.0)),"
+                 " clamp(abs(dpdy(tex0_uv.x)) * 64.0, 0.0, 1.0), 1.0);";
+  }
+
   std::string fragmentOutput;
   std::string_view fragmentOutputType = "@location(0) vec4f"sv;
   std::string fragmentReturn = "\n    return prev;"s;

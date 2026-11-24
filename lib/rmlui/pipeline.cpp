@@ -1034,6 +1034,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     auto& resources = gfx::detail::resources();
     pass.SetVertexBuffer(0, resources.vertexBuffer, data.vertexRange.offset, data.vertexRange.size);
     pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint32, data.indexRange.offset, data.indexRange.size);
+    gfx::forget_index_buffer();
     pass.DrawIndexed(data.indexCount);
   } else {
     pass.Draw(data.vertexCount);

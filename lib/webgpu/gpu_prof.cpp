@@ -4,6 +4,7 @@
 #include "gpu.hpp"
 
 #include <aurora/gfx.h>
+#include "../gfx/encoding.hpp"
 
 #include <tracy/Tracy.hpp>
 
@@ -358,6 +359,14 @@ void accumulate(Slot& slot) {
                                  g_framesTimed, g_passNs / n * 1e-6, g_framesSkipped, g_framesUploadOnly, stats->drawCallCount,
                                  stats->mergedDrawCallCount, stats->lastVertSize / 1024, stats->lastUniformSize / 1024,
                                  stats->lastIndexSize / 1024, stats->lastStorageSize / 1024);
+  uint64_t pipelines = 0;
+  uint64_t textures = 0;
+  uint64_t draws = 0;
+  uint64_t vertices = 0;
+  gfx::take_encode_counts(pipelines, textures, draws, vertices);
+  const double encoded = double(g_framesTimed + g_framesUploadOnly);
+  line += fmt::format("; a frame {:.0f} gx draws, {:.0f} pipeline binds, {:.0f} texture binds, {:.0f} vertices",
+                      draws / encoded, pipelines / encoded, textures / encoded, vertices / encoded);
   for (const auto& [name, total] : rows) {
     line += fmt::format("; {} {:.3f} ms x{:.1f}", name, total.ns / n * 1e-6, double(total.count) / n);
   }

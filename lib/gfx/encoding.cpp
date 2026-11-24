@@ -22,6 +22,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <atomic>
 #include <vector>
 
 #include <tracy/Tracy.hpp>
@@ -34,6 +35,11 @@ using webgpu::g_queue;
 namespace {
 constexpr Module Log{"aurora::gfx"};
 WGPURenderPipeline g_currentPipeline = nullptr;
+bool g_indexBufferBound = false;
+std::atomic<uint64_t> g_pipelineBinds{0};
+std::atomic<uint64_t> g_textureBinds{0};
+std::atomic<uint64_t> g_gxDraws{0};
+std::atomic<uint64_t> g_gxVertices{0};
 
 void apply_viewport(const wgpu::RenderPassEncoder& pass, const Viewport& vp) {
   const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
@@ -43,8 +49,11 @@ void apply_viewport(const wgpu::RenderPassEncoder& pass, const Viewport& vp) {
 
 // AURORA_DEBUG_DRAWS (a profiling aid, never for play): "none" skips every draw, leaving
 // each pass's loads, clears and stores; "pixel" scissors every draw to one pixel, leaving
-// the vertex work and the binning without the fragment work.
-enum class DebugDraws { Normal, None, Pixel };
+// the vertex work and the binning without the fragment work; "empty" keeps every draw's
+// state changes but draws no instances, leaving the cost of the commands alone;
+// "oneuniform" and "onetexture" bind the uniform group or the texture group only once a pass
+// (wrong pictures), to measure what binding them for every draw costs.
+enum class DebugDraws { Normal, None, Pixel, Empty, OneUniform, OneTexture };
 DebugDraws debug_draws() {
   static const DebugDraws mode = [] {
     const char* env = std::getenv("AURORA_DEBUG_DRAWS");
@@ -53,6 +62,15 @@ DebugDraws debug_draws() {
     }
     if (std::strcmp(env, "none") == 0) {
       return DebugDraws::None;
+    }
+    if (std::strcmp(env, "empty") == 0) {
+      return DebugDraws::Empty;
+    }
+    if (std::strcmp(env, "oneuniform") == 0) {
+      return DebugDraws::OneUniform;
+    }
+    if (std::strcmp(env, "onetexture") == 0) {
+      return DebugDraws::OneTexture;
     }
     return std::strcmp(env, "pixel") == 0 ? DebugDraws::Pixel : DebugDraws::Normal;
   }();
@@ -131,6 +149,7 @@ void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const E
 void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, RenderPass& passInfo) {
   ZoneScoped;
   g_currentPipeline = nullptr;
+  g_indexBufferBound = false;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> lastDebugGroupStack;
 #endif
@@ -186,6 +205,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
         render_custom_draw(cmd.data.customDraw, pass, passInfo);
       }
       g_currentPipeline = nullptr;
+      g_indexBufferBound = false;
       pass.SetBindGroup(0, resources().staticBindGroup);
       pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
       if (hasViewport) {
@@ -454,12 +474,49 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
 }
 } // namespace detail
 
+bool debug_empty_draws() { return debug_draws() == DebugDraws::Empty; }
+bool debug_bind_once(bool texture) {
+  static bool boundUniform = false;
+  static bool boundTexture = false;
+  if (debug_draws() == (texture ? DebugDraws::OneTexture : DebugDraws::OneUniform)) {
+    bool& bound = texture ? boundTexture : boundUniform;
+    if (bound && g_indexBufferBound) {
+      return true; // skip: already bound in this pass
+    }
+    bound = true;
+  }
+  return false;
+}
+
+void bind_index_buffer(const wgpu::RenderPassEncoder& pass) {
+  if (g_indexBufferBound) {
+    return;
+  }
+  pass.SetIndexBuffer(resources().indexBuffer, wgpu::IndexFormat::Uint16);
+  g_indexBufferBound = true;
+}
+
+void forget_index_buffer() { g_indexBufferBound = false; }
+
+void note_texture_bind() noexcept { g_textureBinds.fetch_add(1, std::memory_order_relaxed); }
+void note_gx_draw(uint64_t vertices) noexcept {
+  g_gxDraws.fetch_add(1, std::memory_order_relaxed);
+  g_gxVertices.fetch_add(vertices, std::memory_order_relaxed);
+}
+void take_encode_counts(uint64_t& pipelines, uint64_t& textures, uint64_t& draws, uint64_t& vertices) noexcept {
+  vertices = g_gxVertices.exchange(0, std::memory_order_relaxed);
+  pipelines = g_pipelineBinds.exchange(0, std::memory_order_relaxed);
+  textures = g_textureBinds.exchange(0, std::memory_order_relaxed);
+  draws = g_gxDraws.exchange(0, std::memory_order_relaxed);
+}
+
 void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassEncoder& pass) {
   if (pipeline.Get() == g_currentPipeline) {
     return;
   }
   pass.SetPipeline(pipeline);
   g_currentPipeline = pipeline.Get();
+  g_pipelineBinds.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
