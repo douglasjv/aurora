@@ -2,6 +2,8 @@
 // include/aurora/gfx.h; the design is skies-eternal's docs/design/high-frame-rate.md.
 #include "replay.hpp"
 
+#include "../gfx/recording.hpp"
+
 #include "command_processor.hpp"
 #include "dolphin/gx/GXAurora.h"
 #include "dolphin/gx/GXCommandList.h"
@@ -2635,9 +2637,23 @@ void aurora_replay_enable(bool enabled) {
   }
 }
 
+// AURORA_HIDDEN_FRAMES=draw draws the hidden tick frames as before (for comparisons).
+static bool hidden_frames_skipped() {
+  static const bool skipped = [] {
+    const char* env = std::getenv("AURORA_HIDDEN_FRAMES");
+    return env == nullptr || std::strcmp(env, "draw") != 0;
+  }();
+  return skipped;
+}
+
 void aurora_replay_begin_tick() {
   if (!sEnabled) {
     return;
+  }
+  // The tick's own frame is drawn but not shown when it is replayed (aurora_end_frame_hidden),
+  // and its replays draw it again: hold its ops back so that frame can skip its passes.
+  if (hidden_frames_skipped()) {
+    aurora::gfx::detail::defer_frame_encoding();
   }
   sReady = false;
   sSkip = false;
@@ -2702,6 +2718,10 @@ void aurora_replay_close_tick() {
 }
 
 void aurora_end_frame_hidden() {
+  // Its pictures are all drawn by the replays, the last at blend 1 (the tick itself), and each
+  // replay redraws the tick's copies, so only its uploads are needed. A frame that reads
+  // anything back (a depth peek, a capture) is still drawn (gfx/recording.cpp).
+  aurora::gfx::detail::discard_deferred_frame();
   aurora_end_frame_present(false);
   if (!sEnabled || sStart == nullptr || sCapturing) {
     return;

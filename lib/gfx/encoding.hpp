@@ -9,6 +9,8 @@ void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassE
 
 namespace detail {
 void encode_op(wgpu::CommandEncoder& encoder, FramePacket& frame, const FrameOp& op);
+// Only the op's staging copies and texture uploads (a discarded frame's op).
+void encode_op_uploads(wgpu::CommandEncoder& encoder, FramePacket& frame, const FrameOp& op);
 }
 
 } // namespace aurora::gfx

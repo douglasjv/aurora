@@ -5,6 +5,7 @@
 #include "resource_cache.hpp"
 
 #include "clear.hpp"
+#include "depth_peek.hpp"
 #include "pipeline_cache.hpp"
 #include "render_worker.hpp"
 #include "tex_copy_conv.hpp"
@@ -54,6 +55,9 @@ struct FrameRecorder {
   ClipRect cachedScissor;
   bool suppressRenderWorker = false;
   bool normalRequested = false;
+  bool deferEncode = false;     // defer_frame_encoding: ops wait for the frame's end
+  uint32_t deferredFrom = 0;    // the first op held back
+  bool discardDeferred = false; // discard_deferred_frame
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> debugGroupStack;
 #endif
@@ -539,7 +543,7 @@ void restore_efb() {
 }
 
 void enqueue_op(FramePacket& frame, uint32_t opIndex) {
-  if (opIndex >= frame.ops.size() || g_recorder.suppressRenderWorker) {
+  if (opIndex >= frame.ops.size() || g_recorder.suppressRenderWorker || g_recorder.deferEncode) {
     return;
   }
   auto op = frame.ops[opIndex];
@@ -586,8 +590,47 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
 }
 
+// Whether a frame's ops read anything back to the CPU (a capture, a readback task), which
+// needs its passes drawn.
+bool reads_back(const FramePacket& frame, uint32_t from) {
+  for (uint32_t i = from; i < frame.ops.size(); ++i) {
+    const auto& op = frame.ops[i];
+    if (op.type == FrameOpType::EncoderTask && op.encoderTask != nullptr) {
+      const auto type = find_runtime_encoder_task_type(op.encoderTask->type);
+      if (type && type->afterSubmit != nullptr) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Hands the ops defer_frame_encoding held back to the render worker: all of them, or, for a
+// discarded frame, only their uploads.
+void flush_deferred_ops(FramePacket& frame) {
+  if (!g_recorder.deferEncode) {
+    return;
+  }
+  g_recorder.deferEncode = false;
+  const uint32_t from = g_recorder.deferredFrom;
+  const bool discard =
+      g_recorder.discardDeferred && !depth_peek::snapshot_due() && !reads_back(frame, from);
+  g_recorder.discardDeferred = false;
+  for (uint32_t i = from; i < frame.ops.size(); ++i) {
+    if (!discard) {
+      enqueue_op(frame, i);
+      continue;
+    }
+    auto op = frame.ops[i];
+    render_worker::enqueue_encode_pass(frame.frameId, i, [packet = &frame, op = std::move(op)] {
+      encode_op_uploads(packet->encoder, *packet, op);
+    });
+  }
+}
+
 RecordedFrame end_recording() {
   CHECK(g_recorder.active(), "No active recording session");
+  flush_deferred_ops(g_recorder.frame());
   AURORA_ASSERT(!g_recorder.inOffscreen, "end_frame called while offscreen rendering is active");
   AURORA_ASSERT(g_recorder.currentRenderPass == UINT32_MAX,
                 "end_frame called before finish finalized the current render pass");
@@ -631,6 +674,22 @@ void shutdown_recording() {
   g_recorder.frameSlot = 0;
   g_recorder.suppressRenderWorker = false;
   g_recorder.normalRequested = false;
+  g_recorder.deferEncode = false;
+  g_recorder.discardDeferred = false;
+}
+
+void defer_frame_encoding() noexcept {
+  if (!g_recorder.active() || g_recorder.deferEncode) {
+    return;
+  }
+  g_recorder.deferEncode = true;
+  g_recorder.deferredFrom = static_cast<uint32_t>(g_recorder.frame().ops.size());
+}
+
+void discard_deferred_frame() noexcept {
+  if (g_recorder.deferEncode) {
+    g_recorder.discardDeferred = true;
+  }
 }
 
 namespace testing {
