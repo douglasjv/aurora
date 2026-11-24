@@ -439,9 +439,14 @@ void validate_shader_config(const ShaderConfig& config, const ShaderInfo& info, 
     }
     const auto& tcg = config.tcgs[i];
     if (tcg.src == GX_MAX_TEXGENSRC && !(tcg.type >= GX_TG_BUMP0 && tcg.type <= GX_TG_BUMP7)) {
-      UNLIKELY FATAL("GX: a stage reads texcoord {}, but no texgen makes it (undefined on console). Usually a "
-                     "TEV or indirect stage is still set from an earlier draw.\n{}",
-                     i, describe_texturing(config, numTexGens));
+      // The shader samples it at (0, 0), as the console's TEV does (shader.cpp). Said once.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Log.warn("GX: a stage reads texcoord {}, but no texgen makes it; sampling at (0, 0). Usually a TEV or "
+                 "indirect stage is still set from an earlier draw.\n{}",
+                 i, describe_texturing(config, numTexGens));
+      }
     }
     if (tcg.src >= GX_TG_TEX0 && tcg.src <= GX_TG_TEX7) {
       const auto attr = static_cast<GXAttr>(GX_VA_TEX0 + (tcg.src - GX_TG_TEX0));

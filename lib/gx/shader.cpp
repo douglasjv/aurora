@@ -1183,6 +1183,13 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     } else {
       vtxOutAttrs += fmt::format("\n    @location({}) tex{}_uv: vec2f,", vtxOutIdx++, i);
     }
+    if (tcg.src == GX_MAX_TEXGENSRC && !is_emboss_texgen(tcg.type)) {
+      // A stage reads a texcoord that no texgen makes (it is past numTexGens). The console's TEV
+      // then addresses the texture at (0, 0), as Dolphin models it; do the same.
+      vtxXfrAttrs += fmt::format("\n    out.tex{0}_uv = vec2f(0.0);", i);
+      fragmentFnPre += fmt::format("\n    var tex{0}_uv = in.tex{0}_uv.xy;", i);
+      continue;
+    }
     if (is_emboss_texgen(tcg.type)) {
       // Emboss bump: offset the source texcoord by the light projected onto tangent/binormal
       const u32 lightIdx = tcg.type - GX_TG_BUMP0;
