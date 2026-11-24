@@ -11,6 +11,7 @@
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture.hpp"
+#include "../gx/command_processor.hpp"
 #include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
@@ -646,6 +647,7 @@ RecordedFrame end_recording() {
   for (auto& array : gx::g_gxState.arrays) {
     array.cachedRange = {};
   }
+  gx::fifo::forget_array_uploads();
 #if defined(AURORA_GFX_DEBUG_GROUPS)
   if (!g_recorder.debugGroupStack.empty()) {
     for (auto& item : std::ranges::reverse_view(g_recorder.debugGroupStack)) {

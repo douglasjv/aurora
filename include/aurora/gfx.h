@@ -38,6 +38,15 @@ float aurora_get_fps();
 
 void aurora_enable_vsync(bool enabled);
 
+// Merge small draws (skies-eternal fork change; off by default, or AURORA_MERGE_SMALL_DRAWS=1).
+// For a game that invalidates the vertex cache before every primitive and points a texture
+// coordinate array at each primitive's own few coordinates, so no two draws share state: an
+// array whose bytes match its last upload reuses it, small texture coordinate arrays are carried
+// in the vertex stream, and draws that then share state merge. Far fewer draws on a tile-based
+// GPU; the pictures differ only in texture detail along edges where a merged triangle meets an
+// earlier one (see command_processor.cpp). Call before the frame it should apply to.
+void aurora_gx_merge_small_draws(bool enabled);
+
 // Frame replay, for frame rates above the game's own (skies-eternal, decision 0019 fork
 // change; off by default, and nothing below runs until aurora_replay_enable(true)).
 //

@@ -1,5 +1,12 @@
 #include "command_processor.hpp"
 
+#include <array>
+#include <string_view>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
+
+#include <aurora/gfx.h>
 #include <aurora/gfx.hpp>
 
 #include "../gfx/depth_peek.hpp"
@@ -24,6 +31,8 @@
 #include <vector>
 
 namespace aurora::gx::fifo {
+std::array<std::atomic<uint64_t>, 8> g_mergeCounts{};
+std::array<std::atomic<uint64_t>, 4> g_mergeImmCounts{};
 namespace {
 constexpr Module Log{"aurora::gx::fifo"};
 
@@ -145,6 +154,9 @@ struct DrawCache {
   FogRangeLutKey fogRangeKey{};
   bool hasFogRange = false;
   GXVtxFmt lastDrawFmt = GX_MAX_VTXFMT;
+  // The texture coordinates the cached pipeline reads from the vertex stream although the
+  // game indexes them (expand_small_arrays), one bit for each of TEX0..TEX7.
+  u8 expandMask = 0;
 };
 DrawCache sDrawCache;
 
@@ -392,6 +404,88 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
 static u32 sDrawFade = 0;
 // The cached pipeline reads a replay's blended arrays as floats (AttrArray::replayType).
 static bool sPipelineFloatArrays = false;
+// The texture coordinates the draw being pushed carries in its vertex stream (DrawCache::expandMask).
+static u8 sDrawExpandMask = 0;
+
+// Merging small draws (aurora_gx_merge_small_draws, or AURORA_MERGE_SMALL_DRAWS=1; off by
+// default). A game that invalidates the vertex cache before every primitive and indexes a
+// small texture coordinate array of each primitive's own makes every draw upload its arrays
+// again, and none merge. With this on, an array whose bytes are those of its last upload
+// reuses it, small texture coordinate arrays are carried in the vertex stream
+// (expand_small_arrays), and a draw whose state comes out the same as the last draw's merges
+// with it. The pictures differ only where a merged triangle shares an edge with an earlier
+// one: a GPU may shade fragments of both in one 2x2 quad, so the texture's level of detail
+// along the edge comes from screen derivatives across the two (Apple M-series: tens of
+// pixels a picture, a few levels at most). Aurora's merging of draws with no state change at
+// all does the same.
+static std::atomic<bool> sMergeSmallDrawsSetting = [] {
+  const char* env = std::getenv("AURORA_MERGE_SMALL_DRAWS");
+  return env != nullptr && env[0] == '1';
+}();
+// The setting as it stood at the start of the frame being recorded (forget_array_uploads).
+static bool sMergeSmallDraws = sMergeSmallDrawsSetting.load();
+
+// The last upload of each indexed attribute's array this frame (with sMergeSmallDraws).
+struct ArrayUpload {
+  gfx::Range range;
+  u8 replayType = 0xFF;
+  u8 replayStride = 0;
+  std::vector<u8> bytes;
+};
+static std::array<ArrayUpload, GX_VA_TEX7 + 1> sArrayUploads;
+static void upload_array(int attr, GXVtxFmt fmt) noexcept {
+  auto& array = g_gxState.arrays[attr];
+  replay::note_read(array.data, array.size);
+  if (array.cachedRange.size != 0) {
+    return;
+  }
+  u32 size = array.size;
+  const void* bytes = replay::array_bytes(static_cast<GXAttr>(attr), fmt, array, size);
+  if (!sMergeSmallDraws || bytes == nullptr) {
+    array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(bytes), size);
+    return;
+  }
+  auto& last = sArrayUploads[attr];
+  if (last.range.size != 0 && last.replayType == array.replayType && last.replayStride == array.replayStride &&
+      last.bytes.size() == size && std::memcmp(last.bytes.data(), bytes, size) == 0) {
+    array.cachedRange = last.range;
+    return;
+  }
+  array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(bytes), size);
+  last.range = array.cachedRange;
+  last.replayType = array.replayType;
+  last.replayStride = array.replayStride;
+  const auto* b = static_cast<const u8*>(bytes);
+  last.bytes.assign(b, b + size);
+}
+
+// A draw whose only change since the draw before is the immediates being marked dirty (the
+// vertex cache invalidated, the current matrix set again) and whose immediates come out the
+// same apart from where its vertices start: the state is the last draw's, so it is clean.
+static bool immediates_unchanged(GXVtxFmt fmt) noexcept {
+  const auto* last = gfx::get_last_draw_command<DrawData>();
+  if (last == nullptr || last->immediateData.currentPnMtx != g_gxState.currentPnMtx ||
+      last->immediateData.fade != 0 || sPipelineFloatArrays) {
+    return false;
+  }
+  for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+    if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) {
+      continue;
+    }
+    upload_array(i, fmt);
+    const auto& array = g_gxState.arrays[i];
+    if (array.replayType != 0xFF || array.cachedRange.offset != last->immediateData.arrayStart[i - GX_VA_POS]) {
+      return false;
+    }
+  }
+  const auto& cache = sDrawCache;
+  if (cache.config.shaderConfig.fogRangeEnabled &&
+      (!cache.hasFogRange || cache.fogRangeKey != fog_range_lut_key() ||
+       last->immediateData.fogRangeBase != cache.fogRange.offset / sizeof(u32))) {
+    return false;
+  }
+  return true;
+}
 // Textures a replay's cross-faded draw binds instead of the state's (its previous cell's).
 static std::span<const replay::PreviousTexture> sTextureOverride;
 
@@ -406,13 +500,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     if (state.vtxDesc[i] != GX_INDEX8 && state.vtxDesc[i] != GX_INDEX16) {
       continue;
     }
+    upload_array(i, fmt);
     auto& array = state.arrays[i];
-    replay::note_read(array.data, array.size);
-    if (array.cachedRange.size == 0) {
-      u32 size = array.size;
-      const void* bytes = replay::array_bytes(static_cast<GXAttr>(i), fmt, array, size);
-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(bytes), size);
-    }
     floatArrays |= array.replayType != 0xFF;
     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
   }
@@ -431,6 +520,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
     populate_pipeline_config(cache.config, prim, fmt);
+    cache.expandMask = sDrawExpandMask;
     sPipelineFloatArrays = floatArrays;
     cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
     cache.pipelineRef = gfx::pipeline_ref(cache.config);
@@ -520,6 +610,143 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, numIndices);
 }
 
+// Small indexed texture coordinate arrays, carried in the vertex stream. Skies of Arcadia
+// points GX_VA_TEX0 at a few coordinates of each primitive's own (18 to 66 bytes) and
+// invalidates the vertex cache before every primitive, so every draw had arrays of its own
+// and none merged: a busy village made 3,085 draws of about ten vertices, and on a tile-based
+// GPU each draw's set-up is paid in the binning pass and again in every bin. An expanded
+// coordinate is the array's bytes (big-endian, as the stream's are) in place of its index,
+// read by the shader as a direct attribute with the same conversion, so the values are the
+// same. Not for a replay's blended arrays (read as floats), an index past its array, or
+// NBT normals. Only with sMergeSmallDraws.
+constexpr u32 MaxExpandedArray = 512;
+
+struct ExpandedDraw {
+  u8 mask = 0;
+};
+
+// Sets the expanded coordinates' vertex descriptors to direct while the draw is pushed.
+struct VtxDescOverride {
+  u8 mask;
+  std::array<GXAttrType, GX_VA_TEX7 + 1> saved{};
+  explicit VtxDescOverride(u8 m) : mask(m) {
+    for (int t = 0; t < 8; ++t) {
+      if (mask & (1u << t)) {
+        saved[GX_VA_TEX0 + t] = g_gxState.vtxDesc[GX_VA_TEX0 + t];
+        g_gxState.vtxDesc[GX_VA_TEX0 + t] = GX_DIRECT;
+      }
+    }
+  }
+  ~VtxDescOverride() {
+    for (int t = 0; t < 8; ++t) {
+      if (mask & (1u << t)) {
+        g_gxState.vtxDesc[GX_VA_TEX0 + t] = saved[GX_VA_TEX0 + t];
+      }
+    }
+  }
+  VtxDescOverride(const VtxDescOverride&) = delete;
+  VtxDescOverride& operator=(const VtxDescOverride&) = delete;
+};
+
+static ExpandedDraw expand_small_arrays(GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* vertices,
+                                        ByteBuffer& out) noexcept {
+  ExpandedDraw result;
+  if (!sMergeSmallDraws || vtxCount == 0) {
+    return result;
+  }
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  struct Source {
+    const u8* bytes = nullptr;
+    u32 size = 0;
+    u32 elemBytes = 0;
+    u8 compSize = 0;
+    bool swap = false;
+  };
+  std::array<Source, 8> sources{};
+  for (int t = 0; t < 8; ++t) {
+    const int i = GX_VA_TEX0 + t;
+    const auto type = g_gxState.vtxDesc[i];
+    if (type != GX_INDEX8 && type != GX_INDEX16) {
+      continue;
+    }
+    auto& array = g_gxState.arrays[i];
+    if (array.data == nullptr || array.size == 0 || array.size > MaxExpandedArray || array.stride == 0) {
+      continue;
+    }
+    const auto attr = static_cast<GXAttr>(i);
+    const auto& attrFmt = vtxFmt.attrs[i];
+    const u8 compSize = comp_type_size(attr, attrFmt.type);
+    const u32 elemBytes = compSize * comp_cnt_count(attr, attrFmt.cnt);
+    if (elemBytes > array.stride) {
+      continue;
+    }
+    replay::note_read(array.data, array.size);
+    u32 size = array.size;
+    const void* bytes = replay::array_bytes(attr, fmt, array, size);
+    if (array.replayType != 0xFF || bytes == nullptr) {
+      continue;
+    }
+    sources[t] = Source{static_cast<const u8*>(bytes), size, elemBytes, compSize, array.le && compSize > 1};
+    result.mask |= 1u << t;
+  }
+  if (result.mask == 0) {
+    return result;
+  }
+  // The stream's layout, attribute by attribute, as populate_pipeline_config lays it out.
+  u32 newSize = vtxSize;
+  for (int t = 0; t < 8; ++t) {
+    if (result.mask & (1u << t)) {
+      newSize += sources[t].elemBytes - (g_gxState.vtxDesc[GX_VA_TEX0 + t] == GX_INDEX8 ? 1 : 2);
+    }
+  }
+  out.clear();
+  out.append_zeroes(size_t(newSize) * vtxCount);
+  u8* dst = out.data();
+  const u8* src = vertices;
+  for (u16 v = 0; v < vtxCount; ++v) {
+    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+      const auto type = g_gxState.vtxDesc[i];
+      if (type == GX_NONE) {
+        continue;
+      }
+      const auto attr = static_cast<GXAttr>(i);
+      const auto& attrFmt = vtxFmt.attrs[i];
+      u32 len;
+      if (type == GX_DIRECT) {
+        len = comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
+      } else {
+        const bool nbt3 = i == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3;
+        len = type == GX_INDEX8 ? (nbt3 ? 3 : 1) : (nbt3 ? 6 : 2);
+      }
+      const int t = i - GX_VA_TEX0;
+      if (t >= 0 && (result.mask & (1u << t))) {
+        const auto& source = sources[t];
+        const u32 index = type == GX_INDEX8 ? src[0] : (u32(src[0]) << 8 | src[1]);
+        const u32 at = index * g_gxState.arrays[i].stride;
+        if (at + source.elemBytes > source.size) {
+          return {}; // an index past its array: leave the draw as the game made it
+        }
+        const u8* elem = source.bytes + at;
+        if (source.swap) {
+          for (u32 c = 0; c < source.elemBytes; c += source.compSize) {
+            for (u32 b = 0; b < source.compSize; ++b) {
+              dst[c + b] = elem[c + source.compSize - 1 - b];
+            }
+          }
+        } else {
+          std::memcpy(dst, elem, source.elemBytes);
+        }
+        dst += source.elemBytes;
+      } else {
+        std::memcpy(dst, src, len);
+        dst += len;
+      }
+      src += len;
+    }
+  }
+  return result;
+}
+
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
   ZoneScoped;
   u32 vtxSize;
@@ -539,10 +766,6 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       handle_draw_overrun(totalVtxBytes, reader);
     }
 
-  const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
-                          prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
-  auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
-
   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
   if (trace_2d::enabled() && !replay::replaying())
@@ -554,6 +777,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       // A replay's cross-faded flipbook: this tick's cell scaled by weight, the previous
       // tick's by 1 - weight (with its own textures, when it swapped them), each a draw of
       // its own (a draw's fade is per draw).
+      if (sDrawCache.expandMask != 0) {
+        g_gxState.dirty |= DirtyPipeline;
+      }
       gfx::Range vertRange = gfx::push_verts(vertices, vertexData.size(), 4);
       sDrawFade = std::bit_cast<u32>(1.f - fade.weight);
       handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
@@ -578,8 +804,68 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       sDrawFade = 0;
       return;
     }
+  // Texture coordinates the game indexes from small arrays of their own are carried in the
+  // vertex stream instead, so the draws merge (expand_small_arrays).
+  static ByteBuffer expanded;
+  const ExpandedDraw exp = expand_small_arrays(fmt, vtxCount, vtxSize, vertices, expanded);
+  if (exp.mask != 0) {
+    vertices = expanded.data();
+  }
+  const size_t vertexBytes = exp.mask != 0 ? expanded.size() : vertexData.size();
+  sDrawExpandMask = exp.mask;
+  if (exp.mask != sDrawCache.expandMask) {
+    g_gxState.dirty |= DirtyPipeline;
+  }
+  const VtxDescOverride vtxDescOverride{exp.mask};
+
+  if (sMergeSmallDraws && g_gxState.dirty == DirtyImmediates && fmt == sDrawCache.lastDrawFmt &&
+      sDrawCache.lineMode == 0 && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
+      immediates_unchanged(fmt)) {
+    g_gxState.dirty = 0;
+  }
+  const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
+                          prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
+  auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
+  {
+    // Profiling counts (AURORA_GPU_TIMES line): why a draw did not merge with the one before.
+    auto& c = g_mergeCounts;
+    auto& c2 = g_mergeImmCounts;
+    const u32 d = g_gxState.dirty;
+    if (d & DirtyPipeline) c[0].fetch_add(1, std::memory_order_relaxed);
+    if (d & DirtyTextures) c[1].fetch_add(1, std::memory_order_relaxed);
+    if (d & DirtyUniform) c[2].fetch_add(1, std::memory_order_relaxed);
+    if (d & DirtyImmediates) c[3].fetch_add(1, std::memory_order_relaxed);
+    if (d == 0 && fmt != sDrawCache.lastDrawFmt) c[4].fetch_add(1, std::memory_order_relaxed);
+    if (cleanState && lastDraw == nullptr) c[5].fetch_add(1, std::memory_order_relaxed);
+    if (lastDraw != nullptr) c[6].fetch_add(1, std::memory_order_relaxed);
+    c[7].fetch_add(1, std::memory_order_relaxed);
+    if (d == DirtyImmediates && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 && prim != GX_LINES &&
+        prim != GX_LINESTRIP && prim != GX_POINTS) {
+      if (const auto* last = gfx::get_last_draw_command<DrawData>()) {
+        bool pnmtx = last->immediateData.currentPnMtx != g_gxState.currentPnMtx;
+        bool invalidated = false;
+        bool moved = false;
+        for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+          if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) {
+            continue;
+          }
+          const auto& array = g_gxState.arrays[i];
+          if (array.cachedRange.size == 0) {
+            invalidated = true;
+          } else if (array.cachedRange.offset != last->immediateData.arrayStart[i - GX_VA_POS]) {
+            moved = true;
+          }
+        }
+        if (pnmtx) c2[0].fetch_add(1, std::memory_order_relaxed);
+        if (invalidated) c2[1].fetch_add(1, std::memory_order_relaxed);
+        if (moved) c2[2].fetch_add(1, std::memory_order_relaxed);
+        if (!pnmtx && !invalidated && !moved) c2[3].fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
   const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1 && lastDraw->immediateData.fade == 0;
-  gfx::Range vertRange = gfx::push_verts(vertices, vertexData.size(), canMerge ? 0 : 4);
+  gfx::Range vertRange = gfx::push_verts(vertices, vertexBytes, canMerge ? 0 : 4);
 
   // Try to merge with previous draw call
   if (canMerge) {
@@ -885,6 +1171,15 @@ namespace {
 std::array<DrawCache, 2> sSavedDrawCache;
 } // namespace
 
+void set_merge_small_draws(bool enabled) noexcept { sMergeSmallDrawsSetting.store(enabled, std::memory_order_relaxed); }
+
+void forget_array_uploads() noexcept {
+  sMergeSmallDraws = sMergeSmallDrawsSetting.load(std::memory_order_relaxed);
+  for (auto& upload : sArrayUploads) {
+    upload.range = {};
+  }
+}
+
 void save_draw_cache(int slot) noexcept {
   auto& saved = sSavedDrawCache[slot];
   saved = sDrawCache;
@@ -898,3 +1193,5 @@ void save_draw_cache(int slot) noexcept {
 void restore_draw_cache(int slot) noexcept { sDrawCache = sSavedDrawCache[slot]; }
 
 } // namespace aurora::gx::fifo
+
+void aurora_gx_merge_small_draws(bool enabled) { aurora::gx::fifo::set_merge_small_draws(enabled); }

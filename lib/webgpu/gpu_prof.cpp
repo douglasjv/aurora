@@ -5,6 +5,7 @@
 
 #include <aurora/gfx.h>
 #include "../gfx/encoding.hpp"
+#include "../gx/command_processor.hpp"
 
 #include <tracy/Tracy.hpp>
 
@@ -367,6 +368,23 @@ void accumulate(Slot& slot) {
   const double encoded = double(g_framesTimed + g_framesUploadOnly);
   line += fmt::format("; a frame {:.0f} gx draws, {:.0f} pipeline binds, {:.0f} texture binds, {:.0f} vertices",
                       draws / encoded, pipelines / encoded, textures / encoded, vertices / encoded);
+  {
+    std::array<uint64_t, 8> m{};
+    for (size_t i = 0; i < m.size(); ++i) {
+      m[i] = gx::fifo::g_mergeCounts[i].exchange(0, std::memory_order_relaxed);
+    }
+    line += fmt::format("; draws recorded {:.0f}: dirty pipeline {:.0f}, textures {:.0f}, uniform {:.0f}, immediates "
+                        "{:.0f}; clean but format {:.0f}, no draw before {:.0f}; mergeable {:.0f}",
+                        m[7] / encoded, m[0] / encoded, m[1] / encoded, m[2] / encoded, m[3] / encoded, m[4] / encoded,
+                        m[5] / encoded, m[6] / encoded);
+    std::array<uint64_t, 4> k{};
+    for (size_t i = 0; i < k.size(); ++i) {
+      k[i] = gx::fifo::g_mergeImmCounts[i].exchange(0, std::memory_order_relaxed);
+    }
+    line += fmt::format("; only immediates dirty: matrix {:.0f}, array invalidated {:.0f}, array moved {:.0f}, "
+                        "unchanged {:.0f}",
+                        k[0] / encoded, k[1] / encoded, k[2] / encoded, k[3] / encoded);
+  }
   for (const auto& [name, total] : rows) {
     line += fmt::format("; {} {:.3f} ms x{:.1f}", name, total.ns / n * 1e-6, double(total.count) / n);
   }
