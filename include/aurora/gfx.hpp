@@ -154,7 +154,10 @@ struct ResolvedTargets {
   // single-sample R32Float depth snapshot; null if not requested
   wgpu::Texture depthTexture;
   wgpu::TextureView depth;
-  // RGB10A2Unorm snapshot; null when not requested or unavailable
+  // RGB10A2Unorm snapshot; null when not requested or unavailable. RGB is the view-space
+  // normal * 0.5 + 0.5, scaled by how much of the pixel the draw's fog left showing
+  // (1 - fog; a draw without a normal writes (that, 0, 0)); alpha 1 for a normal, 1/3 for
+  // a cutout hint, 0 for none.
   wgpu::Texture normalTexture;
   wgpu::TextureView normal;
   wgpu::TextureFormat colorFormat = wgpu::TextureFormat::Undefined;

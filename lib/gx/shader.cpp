@@ -1990,13 +1990,19 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
         normalAttachment);
     fragmentOutputType = "FragmentOutput"sv;
     fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = prev;";
+    // The vector's length is how much of the pixel the fog leaves showing (1 - fogZ), so a
+    // pass that inks edges can fade them into the fog as the scene does. A draw without a
+    // normal writes a vector along x of that length, with alpha 0.
+    const bool fogged = info.usesFog && debugFragments == 0;
+    const std::string_view fogVis = fogged ? "(1.0 - clamp(fogZ, 0.0, 1.0))"sv : "1.0"sv;
     if (useNormalTarget) {
-      fragmentReturn +=
+      fragmentReturn += fmt::format(
           "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
           "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
-          "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));";
+          "\n    out.normal = vec4f(unit_nrm * {} * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));",
+          fogVis);
     } else {
-      fragmentReturn += "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);";
+      fragmentReturn += fmt::format("\n    out.normal = vec4f({} * 0.5 + 0.5, 0.5, 0.5, 0.0);", fogVis);
     }
     if (config.cutoutHint) {
       fragmentReturn += "\n    out.normal.w = 1.0 / 3.0;";
