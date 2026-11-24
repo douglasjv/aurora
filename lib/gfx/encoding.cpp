@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -40,7 +41,29 @@ void apply_viewport(const wgpu::RenderPassEncoder& pass, const Viewport& vp) {
   pass.SetViewport(vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth);
 }
 
+// AURORA_DEBUG_DRAWS (a profiling aid, never for play): "none" skips every draw, leaving
+// each pass's loads, clears and stores; "pixel" scissors every draw to one pixel, leaving
+// the vertex work and the binning without the fragment work.
+enum class DebugDraws { Normal, None, Pixel };
+DebugDraws debug_draws() {
+  static const DebugDraws mode = [] {
+    const char* env = std::getenv("AURORA_DEBUG_DRAWS");
+    if (env == nullptr) {
+      return DebugDraws::Normal;
+    }
+    if (std::strcmp(env, "none") == 0) {
+      return DebugDraws::None;
+    }
+    return std::strcmp(env, "pixel") == 0 ? DebugDraws::Pixel : DebugDraws::Normal;
+  }();
+  return mode;
+}
+
 void apply_scissor(const wgpu::RenderPassEncoder& pass, const ClipRect& sc, const wgpu::Extent3D& size) {
+  if (debug_draws() == DebugDraws::Pixel) {
+    pass.SetScissorRect(0, 0, 1, 1);
+    return;
+  }
   const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
   const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
   const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
@@ -154,12 +177,14 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
     } break;
     case CommandType::Draw: {
       auto& draw = cmd.data.draw;
-      if (draw.encoder != nullptr) {
+      if (draw.encoder != nullptr && debug_draws() != DebugDraws::None) {
         draw.encoder(draw.payload.data(), pass, passInfo);
       }
     } break;
     case CommandType::CustomDraw: {
-      render_custom_draw(cmd.data.customDraw, pass, passInfo);
+      if (debug_draws() != DebugDraws::None) {
+        render_custom_draw(cmd.data.customDraw, pass, passInfo);
+      }
       g_currentPipeline = nullptr;
       pass.SetBindGroup(0, resources().staticBindGroup);
       pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
@@ -402,6 +427,10 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
 } // namespace
 
 namespace detail {
+void encode_op_uploads(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
+  copy_staging_to_high_water(cmd, frame, op);
+}
+
 void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
   copy_staging_to_high_water(cmd, frame, op);
   switch (op.type) {

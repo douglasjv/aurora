@@ -10,6 +10,8 @@
 #include <dolphin/gx/GXEnum.h>
 
 #include <absl/container/flat_hash_set.h>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string_view>
 #include <utility>
@@ -2190,6 +2192,14 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
   }
   if (EnableDebugPrints) {
     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
+  }
+  // Profiling aid: AURORA_DUMP_SHADERS=<dir> writes each generated shader to <dir>/<hash>.wgsl.
+  static const char* dumpDir = std::getenv("AURORA_DUMP_SHADERS");
+  if (dumpDir != nullptr) {
+    if (FILE* f = std::fopen(fmt::format("{}/{:016x}.wgsl", dumpDir, hash).c_str(), "w")) {
+      std::fwrite(shaderSource.data(), 1, shaderSource.size(), f);
+      std::fclose(f);
+    }
   }
 
   return shaderSource;
