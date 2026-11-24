@@ -3,6 +3,8 @@
 #include "../internal.hpp"
 #include "gpu.hpp"
 
+#include <aurora/gfx.h>
+
 #include <tracy/Tracy.hpp>
 
 #ifdef TRACY_ENABLE
@@ -296,6 +298,7 @@ std::map<std::string, PassTotal> g_passTotals;
 double g_passNs = 0;
 uint32_t g_framesTimed = 0;
 uint32_t g_framesSkipped = 0;
+uint32_t g_framesUploadOnly = 0;
 
 std::string_view base_name(std::string_view name) {
   size_t end = name.size();
@@ -315,6 +318,7 @@ void accumulate(Slot& slot) {
   }
   double passes = 0;
   uint32_t depth = 0;
+  bool drew = false; // a pass besides the staging copies (a hidden frame skipped by replay has only those)
   for (const auto& event : slot.events) {
     if (event.kind == EventKind::End) {
       --depth;
@@ -328,6 +332,7 @@ void accumulate(Slot& slot) {
       ++total.count;
       if (depth == 0) {
         passes += double(end - begin);
+        drew = drew || base_name(event.name) != "Staging copies";
       }
     }
     ++depth;
@@ -337,21 +342,29 @@ void accumulate(Slot& slot) {
     return;
   }
   g_passNs += passes;
+  if (!drew) {
+    ++g_framesUploadOnly; // its uploads count toward the drawn frames' time
+    return;
+  }
   if (++g_framesTimed < g_logEvery) {
     return;
   }
   std::vector<std::pair<std::string, PassTotal>> rows{g_passTotals.begin(), g_passTotals.end()};
   std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
   const double n = double(g_framesTimed);
-  std::string line = fmt::format("GPU over {} frames: passes {:.2f} ms a frame ({} without timestamps)", g_framesTimed,
-                                 g_passNs / n * 1e-6, g_framesSkipped);
+  const AuroraStats* stats = aurora_get_stats();
+  std::string line = fmt::format("GPU over {} frames: passes {:.2f} ms a frame ({} without timestamps, {} uploads only; last frame "
+                                 "{} draws, {} merged, verts {} KB, uniforms {} KB, indices {} KB, storage {} KB)",
+                                 g_framesTimed, g_passNs / n * 1e-6, g_framesSkipped, g_framesUploadOnly, stats->drawCallCount,
+                                 stats->mergedDrawCallCount, stats->lastVertSize / 1024, stats->lastUniformSize / 1024,
+                                 stats->lastIndexSize / 1024, stats->lastStorageSize / 1024);
   for (const auto& [name, total] : rows) {
     line += fmt::format("; {} {:.3f} ms x{:.1f}", name, total.ns / n * 1e-6, double(total.count) / n);
   }
   Log.info("{}", line);
   g_passTotals.clear();
   g_passNs = 0;
-  g_framesTimed = g_framesSkipped = 0;
+  g_framesTimed = g_framesSkipped = g_framesUploadOnly = 0;
 }
 
 Slot& record_slot() { return g_slots[g_recordSlot]; }
