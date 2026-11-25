@@ -1,6 +1,7 @@
 #include "command_processor.hpp"
 
 #include "../gfx/recording.hpp"
+#include "../gfx/hash.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
 #include "dolphin/gx/GXAurora.h"
@@ -391,7 +392,16 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     }
     auto& array = state.arrays[i];
     if (array.cachedRange.size == 0) {
-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+      // A game that invalidates the vertex cache before every model (Phantasy Star Online does)
+      // would upload the same arrays again and again: one frame of a big area overran the
+      // storage buffer. Uploads are shared by content within the frame.
+      const u64 key = xxh3_hash_s(array.data, array.size, array.size);
+      if (const auto it = state.arrayUploads.find(key); it != state.arrayUploads.end() && it->second.size == array.size) {
+        array.cachedRange = it->second;
+      } else {
+        array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+        state.arrayUploads[key] = array.cachedRange;
+      }
     }
     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
   }

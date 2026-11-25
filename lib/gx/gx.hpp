@@ -380,6 +380,9 @@ struct GXState {
   std::array<IndStage, MaxIndStages> indStages;
   std::array<IndTexMtxInfo, MaxIndTexMtxs> indTexMtxs;
   std::array<AttrArray, MaxVtxAttr> arrays;
+  // This frame's uploads of indexed vertex arrays, by content: an array invalidated
+  // (GXInvalidateVtxCache) or re-set with the same bytes reuses its upload. Cleared each frame.
+  absl::flat_hash_map<u64, gfx::Range> arrayUploads;
   bool depthCompare = true;
   bool depthUpdate = true;
   bool colorUpdate = true;

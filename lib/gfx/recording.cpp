@@ -285,6 +285,18 @@ void seal_pass(FramePacket& frame, uint32_t passIndex) {
 }
 
 Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment) {
+  if (!target.owned() && AURORA_ALIGN(target.size(), alignment ? alignment : 1) + length > target.capacity()) {
+    // The frame's buffers are mapped staging memory of a fixed size: say which one is full
+    // (ByteBuffer::resize would abort with no word).
+    const auto& frame = current_frame_packet();
+    const char* which = &target == &frame.verts      ? "vertex"
+                        : &target == &frame.indices  ? "index"
+                        : &target == &frame.uniforms ? "uniform"
+                        : &target == &frame.storage  ? "storage"
+                                                     : "staging";
+    Log.fatal("a frame's {} buffer is full: {} bytes used of {}, {} more asked", which, target.size(),
+              target.capacity(), length);
+  }
   if (alignment != 0) {
     const size_t begin = target.size();
     const size_t alignedBegin = AURORA_ALIGN(begin, alignment);
@@ -725,6 +737,7 @@ RecordedFrame end_recording() {
   for (auto& array : gx::g_gxState.arrays) {
     array.cachedRange = {};
   }
+  gx::g_gxState.arrayUploads.clear();
 #if defined(AURORA_GFX_DEBUG_GROUPS)
   if (!g_recorder.debugGroupStack.empty()) {
     for (auto& item : std::ranges::reverse_view(g_recorder.debugGroupStack)) {
