@@ -316,6 +316,16 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
     minLod = 0.f;
     maxLod = 1000.f;
     if (!mipsEnabled) {
+      // The game asked for one level. A replacement larger than the original may still use its
+      // own levels down to the original's size (an image at 4x has levels 0 to 2), which keeps a
+      // 4x image drawn small from shimmering more than the original did, but never below it: past
+      // that it would be blurrier than the original on a surface seen at an angle.
+      const uint32_t original = std::max<uint32_t>(texObj.width(), 1);
+      uint32_t levels = 0;
+      while (levels + 1 < ref->mipCount && (ref->size.width >> (levels + 1)) >= original) {
+        ++levels;
+      }
+      maxLod = static_cast<float>(levels);
       mipFilter = aurora::texture::generate_replacement_mipmaps() ? wgpu::MipmapFilterMode::Linear
                                                                   : wgpu::MipmapFilterMode::Nearest;
     }
